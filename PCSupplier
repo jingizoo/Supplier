@@ -1,0 +1,1881 @@
+
+/*****************************************************************************************/
+/*~Transunion Jalaj Mehta 04/13/2020 Vendor Create/Update Program*/
+/*~Initial Code for Coupa Integration*/
+/*~Transunion 2354 Jalaj Mehta 08/05/2021 SIM Asia Integration*/
+rem refer to keyword 2354 in the code;
+/*****************************************************************************************/
+/*****************************************************************************************/
+/* #6183, Dt 1/27/2022, Madhu Boddupalli, Code updated to skip inactive RTA rows         */
+/* #7088, Dt 2/1/2022, Madhu Boddupalli, APAC (27000/27100/27500) users input 6 chars  	 */
+/* 	in Bank Code field and bank account number in Bank Account field in coupa. 	 */
+/* 	Updated PS SIM interface to read the information accordingly and process it. 	 */
+/* #7387, dt 1/12/2022, Gopinath Linga, Project Colombia changes	 */
+/* #7456, dt 5/13/2022, Madhu Boddupalli, Modified logic to assign pay group for UKALL   */
+/* #8646, dt 6/17/2022, Madhu Boddupalli, Updated code assign the withholding values 	 */
+/* 	based on withholding rules for Colombia regions ONLY	 */
+/* #7398, dt 8/5/2022, Madhu Boddupalli, Vendor termination logic is added	 	 */
+/* #9672, Madhu Boddupalli - Colombia BAU change - Assign Pay Group and Bank Code 	 */
+/* #10452, dt 12/28/2022, Madhu Boddupalli - Updated withholding address seq num logic	 */
+/* #9082, dt 9/26/2022, Madhu Boddupalli, Project Neustar/Sontiq related changes	 */
+/*        The organization code field is used to differentiate Colombia and Costa Rica	 */
+/* #11479, 3/23/2022, Madhu Boddupalli - Populate SWIFT code in bank section for Canada  */
+/* #11097, 4/23/2022, Madhu Boddupalli - Input Routing Number as Bank ID for Puerto Rico */
+/* #8953, dt 3/10/2023, Madhu Boddupalli, Project Argus (Verisk) related changes	 */
+/* #11929, 5/9/2023, Mdhu Boddupalli - Update withholding jurisdiction code form BLORE 	 */
+/* 	to MUMB for 22100 BU	 */
+/* #12169, 05/17/2023 Alice Mak, added logic to insert Vendor Location Id Number         */
+/*         Collection for each Id Type to fix integration error of invalid item number   */
+/*         so cannot access member STD_ID_NUM_QUAL.                                      */
+/* #12082, 05/23/2023 Alice Mak, Address SEQ and Location SEQ should be a 1 to 1 relation*/
+/* #12475, 06/21/2023, Madhu Boddupalli - For Bank of Canada, DFIID should be Branch ID  */
+/*	+ Bank ID if SWIFT Code is not available	 */
+/*****************************************************************************************/
+import TUFILEEXT:Log;
+
+Declare Function tax_geocode PeopleCode FUNCLIB_TAX.GEO_CODE FieldFormula;
+Local Rowset &rs_tu_cp_dt_explCharge, &rs_tu_cp_dt_explLocation, &rs_tu_cp_dt_explAddress, &rs_tu_cp_dt_explContact, &rs_tu_cp_dt_InvHdr, &rs_hdr_stg, &rs_line_stg, &rs_dist_stg, &rs_pymnt_stg, &rs_tu_cp_dt_explHdr, &rs_tu_cp_dt_explLine, &rs_tu_cp_dt_explDist, &rs_tu_cp_o2p_map, &rs_tu_cp_dt_MetadataHeader, &rs_tu_cp_dt_MetadataLine, &rs_tu_cp_dt_MetadataLineSplit;
+Local array of string &aFieldArray;
+Component File &logfile;
+Component TUFILEEXT:Log &oLog;
+Component array of array of string &o2pArray2d_meta, &o2pArray2d;
+Local array of Row &aSourceArray;
+Local Row &row;
+Local Record &rVendor, &rVendorAddress, &rVendorAddressPhone, &rVendorContact, &rVendorLoc, &rVendorWthd, &rVendorJur, &rVendorLCID, &rVendorPay, &rVendorBankAcct, &rVendorEmailPay, &rVendorContactScroll, &rVendorAddrScroll, &rVendorLocScroll;
+Local array of array of string &aAddressSeq;
+Local array of string &debugArray;
+Local integer &rta_active_loc_num; /* #6183, 1/27/2022, Madhu Boddupalli */
+
+Function printdebug(&debugArray)
+   While (&debugArray.len > 0)
+      &message = &debugArray.shift();
+      &oLog.LogitDebug(&message);
+   End-While;
+End-Function;
+
+/*************************************************/
+rem TU 2354 Jalaj Asia Implementation 06/11/2021;
+Function isApacSetId(&setId As string) Returns boolean
+   rem validate if a setid is APAC Region SETID;
+   SQLExec(SQL.TU_CP_APAC_SETID_SQL, &setId, &exists);
+   If All(&exists) Then
+      Return True;
+   End-If;
+   Return False;
+End-Function;
+
+Function isIndiaSetId(&setId As string) Returns boolean
+   rem validate if a setid is India Region SETID;
+   SQLExec(SQL.TU_CP_IND_SETID_SQL, &setId, &exists);
+   If All(&exists) Then
+      Return True;
+   End-If;
+   Return False;
+End-Function;
+
+/* COL IMP, 2/3/2022, Gopinath Linga - Start */
+Function isLASetId(&setId As string) Returns boolean
+   rem validate if a setid is LA Region SETID;
+   SQLExec(SQL.TU_CP_LA_SETID_SQL, &setId, &exists);
+   If All(&exists) Then
+      Return True;
+   End-If;
+   Return False;
+End-Function;
+
+/* COL IMP, 2/3/2022, Gopinath Linga - END */
+/* #7088, 2/3/2022, Madhu Boddupalli - Start */
+Function isBankDtlsInTwoCols(&setId As string) Returns boolean
+   rem validate if bank info comes in two columns for the setid;
+   SQLExec(SQL.TU_CP_APAC_2COLBANK_SETID_SQL, &setId, &exists);
+   If All(&exists) Then
+      Return True;
+   End-If;
+   Return False;
+End-Function;
+
+/* #7088, 2/3/2022, Madhu Boddupalli - End */
+
+/* #7456, 5/13/2022, Madhu Boddupalli - Pay group for UKALL - Start */
+Function IsPayGroupSetid(&setId As string) Returns boolean
+   SQLExec(SQL.TU_CP_PAY_GROUP_SETID, &setId, &exists);
+   If All(&exists) Then
+      Return True;
+   End-If;
+   Return False;
+End-Function;
+
+/* #7456, 5/13/2022, Madhu Boddupalli - Pay group for UKALL - End */
+
+/* #9672, Madhu Boddupalli - Get Supplier Address Seq number - Start */
+/* #10452, Madhu Boddupalli - Modified code to populate withholding address seq number based on the location code - Start */
+rem Function SupplierAddrSeq(&setId As string, &VndId As string) Returns string;
+rem    SQLExec(SQL.TU_CP_SUP_ADDR_SEQ, &setId, &VndId, &AddrSeq);
+Function SupplierAddrSeq(&setId As string, &VndId As string, &VndLoc As string) Returns string
+   SQLExec(SQL.TU_CP_SUP_ADDR_SEQ, &setId, &VndId, &VndLoc, &AddrSeq);
+   /* #10452, Madhu Boddupalli - Modified code to populate withholding address seq number based on the location code - End */
+   If All(&AddrSeq) Then
+      Return &AddrSeq;
+   End-If;
+   Return "";
+End-Function;
+
+/* #9672, Madhu Boddupalli - Get Supplier Address Seq number - Start */
+
+/*************************************************/
+Function errorHandler(&vendorrec As Record, &oPSession)
+   Local ApiObject &oPSMessageCollection, &oPSMessage;
+   Local number &i;
+   Local string &sErrMsgSetNum, &sErrMsgNum, &sErrMsgText, &sErrType, &err_msg;
+   &err_msg = "";
+   &oPSMessageCollection = &oSession.PSMessages;
+   For &i = 1 To &oPSMessageCollection.Count
+      &oPSMessage = &oPSMessageCollection.Item(&i);
+      &sErrMsgSetNum = &oPSMessage.MessageSetNumber;
+      &sErrMsgNum = &oPSMessage.MessageNumber;
+      &sErrMsgText = &oPSMessage.Text;
+      &err_msg = &err_msg | " (" | &oPSMessage.MessageSetNumber | "," | &oPSMessage.MessageNumber | ") " | &oPSMessage.Text | Char(13);
+   End-For;
+   
+   &Rec_Ins = CreateRecord(Record.TU_CP_SIM_MSG);
+   rem  &vendorrec = &pRSVendor(1).GetRecord(1);
+   &vendorrec.CopyFieldsTo(&Rec_Ins);
+   &Rec_Ins.MESSAGE_TEXT_LONG.Value = &err_msg;
+   &Rec_Ins.LAST_UPDATE_DTTM.Value = %Datetime;
+   If Not &Rec_Ins.Insert() Then
+      &oLog.Logit("Error when archive the Error Message to Error Table : " | &err_msg);
+      rem MessageBox(0, "", 0, 0, "Error happen when Load Supplier by Compoment Interface : " | &err_msg);
+   Else
+      rem MessageBox(0, "", 0, 0, "Error Message  ->  : " | &err_msg);
+   End-If;
+   rem CommitWork();
+   &oLog.Logit(&err_msg);
+   &Rec_Ins.save();
+   &oPSMessageCollection.deleteall();
+End-Function;
+
+/*************************************************/
+rem TU 2354 Jalaj Asia Implementation 06/11/2021;
+Function getWitholdJurCode(&setId) Returns string
+   Evaluate &setId
+   When "21100"
+      Return "MUMB";
+   When "21000"
+      Return "MUMB"
+   When "22100"
+      /* #11929 - Mdhu Boddupalli - Update jurisdiction code form BLORE to MUMB - Start */
+      rem Return "BLORE";
+      Return "MUMB";
+      /* #11929 - Mdhu Boddupalli - Update jurisdiction code form BLORE to MUMB - End */
+   When "48720"
+      Return "DELHI";
+   When "27700"
+      Return "FEDER";
+   When-Other
+      Return "FED";
+   End-Evaluate;
+   
+   Return "FED";
+   
+End-Function;
+
+Function getVendorCategory(&setId) Returns string
+   Evaluate &setId
+   When "21100"
+      Return "DOMCO";
+   When "21000"
+      Return "DOMCO"
+   When "22100"
+      Return "DOMCO";
+   When "27700"
+      Return "DOMES";
+   When "48720"
+      Return "DOMCO";
+   When "LAALL"
+      Return "NAT-1";
+   When-Other
+      Return "RPT";
+   End-Evaluate;
+   
+   Return "RPT";
+   
+End-Function;
+
+Function getWitholdingCode(&setId) Returns string
+   rem return witholding code for India/Philippines;
+   Evaluate &setId
+   When "21100"
+      Return "INDIT";
+   When "21000"
+      Return "INDSS"
+   When "22100"
+      Return "INDLP";
+   When "48720"
+      Return "INDLP";
+   When "27700"
+      Return "PHL01";
+   When "LAALL"
+      Return "CIFIN";
+   When-Other
+      Return "IRS";
+   End-Evaluate;
+   
+   Return "IRS";
+   
+End-Function;
+
+Function getWitholdingType(&wthType, &setId) Returns string
+   rem return witholding type for India Setid or else;
+   If isIndiaSetId(&setId) Then
+      Return "INDTD";
+   Else
+      If &setId = "27700" Then
+         Return "PHL01";
+      End-If;
+   End-If;
+   
+   
+   Return &wthType;
+   
+End-Function;
+
+
+Function getWitholdingClass(&withholdClass) Returns string
+   
+   If (Split(&withholdClass, ";").Len) > 1 Then
+      Return Split(&withholdClass, ";")[2];
+   End-If;
+   Return &withholdClass;
+   
+End-Function;
+
+/**************************************************************/
+Function getWitholdPanWar(&setId) Returns string
+   
+   If All(&wthType) Then
+      Return &wthType;
+   End-If;
+   Evaluate &setId
+   When "21100"
+      Return "Mumbai";
+   When "21000"
+      Return "Mumbai"
+   When "22100"
+      Return "Bengaluru";
+   When "48720"
+      Return "DELHI";
+   When-Other
+      Return &wthType;
+   End-Evaluate;
+   
+   Return &wthType;
+   
+End-Function;
+
+/**************************************************************/
+/*****************************************/
+/*Create Rowsets to hold the data*/
+&rs_tu_cp_dt_explHdr = CreateRowset(Record.TU_CP_DT_EXPL);
+&rs_tu_cp_dt_explAddress = CreateRowset(Record.TU_CP_DT_EXPL);
+&rs_tu_cp_dt_explContact = CreateRowset(Record.TU_CP_DT_EXPL);
+&rs_tu_cp_dt_explLocation = CreateRowset(Record.TU_CP_DT_EXPL);
+/*Record to hold the Coupa Vendor Keys*/
+&rTuCPSMVDMAP = CreateRecord(Record.TU_CP_SM_VD_MAP);
+/*Debug Messages*/
+&debugArray = CreateArrayRept("", 0);
+
+/* #7398, 8/5/2022, Madhu Boddupalli - Start */
+SQLExec("SELECT STRING_TEXT FROM PS_STRINGS_TBL WHERE PROGRAM_ID = 'TU_P2P_1' AND STRING_ID = 'INACTIVE_COM_FIELD'", &term_variable);
+rem &totalSupplierCount = &rs_tu_cp_dt_explHdr.Fill("Where tu_cp_char1 = 'SupplierHeader' and processed_flg ='N' AND PROCESS_INSTANCE=:1 and upper(tu_cp_char1) <> Upper('Record Type')", GetRecord().PROCESS_INSTANCE.Value);
+&totalSupplierCount = &rs_tu_cp_dt_explHdr.Fill("Where tu_cp_char1 = 'SupplierHeader' and processed_flg ='N' AND PROCESS_INSTANCE=:1 and upper(tu_cp_char1) <> Upper('Record Type') and Upper(" | &term_variable | ") <> Upper('Terminated')", GetRecord().PROCESS_INSTANCE.Value);
+/* #7398, 8/5/2022, Madhu Boddupalli - End */
+
+
+&oLog.Logit("Total Supplier Count in file(s): " | &totalSupplierCount);
+&oLog.setDebugFlag( True);
+
+If &oTuVndrIdCi = Null Then
+   errorHandler(&rs_tu_cp_dt_explHdr(&HDR_LINE).GetRecord(1), &oSession);
+   &oLog.Logit("Null &oTuVndrIdCi Object");
+   throw CreateException(0, 0, "GetCompIntfc failed");
+End-If;
+
+For &HDR_LINE = 1 To &rs_tu_cp_dt_explHdr.ActiveRowCount
+   /**~~Jalaj Replaced "TU1" with &sSetid*/
+   &sSetid = &rs_tu_cp_dt_explHdr(&HDR_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierHeader" | "SETID"))][2])).Value;
+   rem  &vaCoupaKey = &rs_tu_cp_dt_explHdr(&HDR_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierHeader" | "SIM ID"))][2])).Value | "-" | &rs_tu_cp_dt_explHdr(&HDR_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierHeader" | "Supplier ID"))][2])).Value;
+   &vaCoupaKey = &rs_tu_cp_dt_explHdr(&HDR_LINE).GetRecord(1).TU_CP_CHAR2.Value | "-" | &rs_tu_cp_dt_explHdr(&HDR_LINE).GetRecord(1).TU_CP_CHAR3.Value;
+   
+   /**~~Jalaj Replaced "TU1" with &sSetid*/
+   
+   &oLog.Logit("Processing Line: " | &HDR_LINE | " for Set Id: " | &sSetid);
+   &oSession = %Session;
+   &oTuVndrIdCi = &oSession.GetCompIntfc(CompIntfc.TU_CP_VNDR_ID);
+   &oTuVndrIdCi.InteractiveMode = True;
+   &oTuVndrIdCi.GetHistoryItems = True;
+   &oTuVndrIdCi.EditHistoryItems = True;
+   &oTuVndrIdCi.setid = &sSetid;
+   
+   &aAddressSeq = CreateArrayRept(CreateArrayRept("", 0), 0);
+   
+   /**~~Jalaj Replaced "TU1" with &sSetid*/
+   
+   rem &vaCoupaKey = &rs_tu_cp_dt_explHdr(&HDR_LINE).GetRecord(1).TU_CP_CHAR2.Value | "-" | &rs_tu_cp_dt_explHdr(&HDR_LINE).GetRecord(1).TU_CP_CHAR3.Value;
+   &oLog.LogitDebug("&vaCoupaKey Current: " | &vaCoupaKey);
+   
+   SQLExec("SELECT SETID,VENDOR_ID,VENDOR_STATUS FROM PS_VENDOR WHERE VNDR_FIELD_C30_J = :1", &vaCoupaKey, &setId, &tVendorId, &tVendorStatus);
+   &oLog.LogitDebug("&tVendorId Found: " | &tVendorId);
+   &oLog.LogitDebug("&tVendorStatus Found: " | &tVendorStatus);
+   
+   /* AMAK 03-18-2021 SR#4728: used the &SETID found when setid is not provided on the SIM file */
+   &oLog.LogitDebug("&SETID Found: " | &setId);
+   If None(&sSetid) Then
+      If All(&setId) Then
+         &sSetid = &setId;
+         &oTuVndrIdCi.setid = &sSetid;
+      End-If;
+      /* #9672, Madhu Boddupalli - BAU Code change - Start */
+   Else
+      &setId = &sSetid;
+      /* #9672, Madhu Boddupalli - BAU Code change - End */
+   End-If;
+   /* AMAK 03-18-2021 SR#4728: used the &SETID found when setid is not provided on the SIM file */
+   
+   If All(&tVendorId) Then
+      &oTuVndrIdCi.vendor_id = &tVendorId;
+   Else
+      &oTuVndrIdCi.vendor_id = "NEXT";
+   End-If;
+   
+   &oTuVndrIdCi.Vendor_persistence = "R";
+   
+   try
+      If &oTuVndrIdCi.Create() Then;
+         rem ***** Unable to Create Component Interface for the Add keys provided. *****;
+         &existing = False;
+         &oTuVndrIdCi.VAT_SW = "N";
+         &oLog.Logit("Creating a New Supplier for: " | &vaCoupaKey);
+         GetRecord().VENDOR_STATUS.Value = "N";
+         
+      Else
+         &existing = True;
+         If Not &oTuVndrIdCi.Get() Then
+            rem ***** No rows exist for the specified keys.*****;
+            &oLog.Logit("Error in Get " | &vaCoupaKey);
+            errorHandler(&rs_tu_cp_dt_explHdr(&HDR_LINE).GetRecord(1), &oSession);
+            GetRecord().AE_APPSTATUS.Value = 1;
+            throw CreateException(0, 0, "Get failed");
+         End-If;
+         TU_CP_VCHR_AET.VENDOR_STATUS.Value = &tVendorStatus;
+         REM jm coupa asia;
+         
+         &oLog.Logit("Existing Supplier Coupa Key: " | &vaCoupaKey | " Supplier Id" | &tVendorId);
+      End-If;
+   catch Exception &eGet
+      &oLog.Logit("Cannot Update the Supplier.  Please check if all keys are available. Coupa Key:" | &vaCoupaKey);
+      Continue;
+   end-try;
+   
+   rem &vendorNameShort = &rs_tu_cp_dt_explHdr(&HDR_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierHeader" | "VENDOR_NAME_SHORT"))][2])).Value;
+   rem &vendorNameShortUsr = &rs_tu_cp_dt_explHdr(&HDR_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierHeader" | "VENDOR_NAME_SHORT"))][2])).Value;
+   &vendorName1 = &rs_tu_cp_dt_explHdr(&HDR_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierHeader" | "NAME1"))][2])).Value;
+   /*LSAHOO - Start- Change DBA label to Legal Name*/
+   rem &vendorNameShort = &vendorName1;
+   rem &vendorNameShortUsr = &vendorName1;
+   /*LSAHOO - End- Change DBA label to Legal Name*/
+   &vendorStatus = Left(LTrim(&rs_tu_cp_dt_explHdr(&HDR_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierHeader" | "VENDOR_STATUS"))][2])).Value), 1);
+   &vendorWithHoldingSwitch = Left(&rs_tu_cp_dt_explHdr(&HDR_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierHeader" | "WTHD_SW"))][2])).Value, 1);
+   &corporateSetIdSupplierId = &rs_tu_cp_dt_explHdr(&HDR_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierHeader" | "CORPORATE_SETID-CORPORATE_SUPPLIER_ID"))][2])).Value;
+   &paymentNotificationEmail = &rs_tu_cp_dt_explHdr(&HDR_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierHeader" | "PAYMENT_NOTIFICATION_EMAIL"))][2])).Value;
+   /**************************************************/
+   
+   /*"VNDR_NAME_SHRT_USR
+VENDOR_NAME_SHORT"
+"STD_ID_NUM_QUAL
+STD_ID_NUM"
+*/
+   /***********Asia**************/
+   &panNumber = &rs_tu_cp_dt_explHdr(&HDR_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierHeader" | "PAN_NUMBER"))][2])).Value;
+   &msmeNumber = &rs_tu_cp_dt_explHdr(&HDR_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierHeader" | "MSME_NUMBER"))][2])).Value;
+   
+   
+   /*****************************asia*********************/
+   &dba = &rs_tu_cp_dt_explHdr(&HDR_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierHeader" | "DBA"))][2])).Value;
+   REM &seperate_remit_to = &rs_tu_cp_dt_explAddress(&ADDRESS_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierHeader" | "SEPARATE REMIT TO"))][2])).Value;
+   &debugArray.Push("dba: " | &dba);
+   &debugArray.Push("&panNumber " | &panNumber);
+   &debugArray.Push("&msmeNumber " | &msmeNumber);
+   /*LSAHOO - Start- Change DBA label to Legal Name*/
+   If All(&dba) And
+         All(&vendorName1) Then
+      &name1 = Left(&dba, 40);
+      &name2 = Substring(&dba, 41, 40);
+      &vendorNameShort = &dba;
+      &vendorNameShortUsr = &dba;
+      &wthd_name1 = Substring(&vendorName1, 1, 40);
+      &wthd_name2 = Substring(&vendorName1, 41, 40);
+   Else
+      If None(&dba) And
+            All(&vendorName1) Then
+         &name1 = Left(&vendorName1, 40);
+         &name2 = Substring(&vendorName1, 41, 40);
+         &vendorNameShort = &vendorName1;
+         &vendorNameShortUsr = &vendorName1;
+         &wthd_name1 = "";
+         &wthd_name2 = "";
+      End-If;
+      If All(&dba) And
+            None(&vendorName1) Then
+         &name1 = Left(&dba, 40);
+         &name2 = Substring(&dba, 41, 40);
+         &vendorNameShort = &dba;
+         &vendorNameShortUsr = &dba;
+         &wthd_name1 = "";
+         &wthd_name2 = "";
+      End-If;
+   End-If;
+   &debugArray.Push("name1: " | &name1);
+   &debugArray.Push("name2: " | &name2);
+   &debugArray.Push("wthd name1: " | &wthd_name1);
+   &debugArray.Push("wthd name2: " | &wthd_name2);
+   /*LSAHOO - End- Change DBA label to Legal Name*/
+   
+   If All(&corporateSetIdSupplierId) Then
+      &oTuVndrIdCi.CORP_VNDR_FLG = "Y";
+      &aCorporateSetIdSupplierId = Split(&corporateSetIdSupplierId, "-");
+      &oLog.LogitDebug("&corporateSetIdSupplierId: " | &corporateSetIdSupplierId);
+      try
+         If (&aCorporateSetIdSupplierId.Len) > 1 Then
+            &oTuVndrIdCi.CORPORATE_SETID = &aCorporateSetIdSupplierId [3];
+            &oTuVndrIdCi.CORPORATE_VENDOR = &aCorporateSetIdSupplierId [2];
+            &oLog.LogitDebug(&aCorporateSetIdSupplierId [1] | &aCorporateSetIdSupplierId [2] | &aCorporateSetIdSupplierId [3]);
+         Else
+            REM         &oTuVndrIdCi.CORPORATE_VENDOR = &corporateSetIdSupplierId;
+            &oLog.Logit("Invalid Corporate Setid/Vendor : " | &corporateSetIdSupplierId);
+         End-If;
+      catch Exception &eCorpSupplier
+         &oLog.Logit(&eCorpSupplier.ToString());
+         &oLog.Logit("Invalid Corporate Setid/SupplierId: " | &corporateSetIdSupplierId);
+      end-try;
+   End-If;
+   If Upper(&vendorWithHoldingSwitch) = "F" Then
+      
+      &vendorWithHoldingSwitch = "N";
+      
+   Else
+      &vendorWithHoldingSwitch = "Y";
+   End-If;
+   &debugArray.Push("*********Keys*************");
+   &debugArray.Push("&vendorNameShort: " | &vendorNameShort);
+   &debugArray.Push("&vendorNameShortUsr " | &vendorNameShortUsr);
+   &debugArray.Push("&vendorName1 " | &vendorName1);
+   &debugArray.Push("&vendorStatus " | &vendorStatus);
+   &debugArray.Push("&vendorWithHoldingSwitch " | &vendorWithHoldingSwitch);
+   &debugArray.Push("*********End-Keys*************");
+   
+   &vendorPersistence = "R";
+   &vendorStatusPO = "Y";
+   &oTuVndrIdCi.VENDOR_NAME_SHORT = Left(&vendorNameShort, 14);
+   &oTuVndrIdCi.VNDR_NAME_SHRT_USR = Left(&vendorNameShortUsr, 10);
+   /*LSAHOO - Start- Change DBA label to Legal Name*/
+   /*&oTuVndrIdCi.NAME1 = Left(&vendorName1, 40);
+   &oTuVndrIdCi.NAME2 = Substring(&vendorName1, 41, 40);*/
+   &oTuVndrIdCi.NAME1 = &name1;
+   &oTuVndrIdCi.NAME2 = &name2;
+   /*LSAHOO - End- Change DBA label to Legal Name*/
+   /****************Asia*******************/
+   &oTuVndrIdCi.VENDOR_STATUS = Upper(&vendorStatus);
+   &oTuVndrIdCi.VNDR_FIELD_C30_J = &vaCoupaKey;
+   &oTuVndrIdCi.VENDOR_CLASS = "R";
+   &oTuVndrIdCi.VENDOR_PERSISTENCE = &vendorPersistence;
+   &oTuVndrIdCi.WTHD_SW_VEN = &vendorWithHoldingSwitch;
+   &oTuVndrIdCi.VNDR_STATUS_PO = &vendorStatusPO;
+   /*~Transunion Jalaj 1103 UK Modifications*/
+   
+   /*~Transunion Jalaj 1103 UK Modifications*/
+   &rs_tu_cp_dt_explContact.Fill("Where tu_cp_char1 = 'SupplierContact' and tu_cp_char2 = :2 and processed_flg ='N' AND FILEREFPATHANDFILE = :3 AND PROCESS_INSTANCE=:1 ORDER BY 1,2,to_number(tu_cp_char3),4", GetRecord().PROCESS_INSTANCE.Value, &rs_tu_cp_dt_explHdr(&HDR_LINE).GetRecord(1).TU_CP_CHAR2.Value, &rs_tu_cp_dt_explHdr(&HDR_LINE).GetRecord(1).FILEREFPATHANDFILE.Value);
+   &count_address = &rs_tu_cp_dt_explAddress.Fill("Where tu_cp_char1 = 'SupplierAddress' and tu_cp_char2 = :2 and processed_flg ='N' AND FILEREFPATHANDFILE = :3 AND PROCESS_INSTANCE=:1 ORDER BY 1,2,to_number(tu_cp_char3),4", GetRecord().PROCESS_INSTANCE.Value, &rs_tu_cp_dt_explHdr(&HDR_LINE).GetRecord(1).TU_CP_CHAR2.Value, &rs_tu_cp_dt_explHdr(&HDR_LINE).GetRecord(1).FILEREFPATHANDFILE.Value);
+   &rs_tu_cp_dt_explLocation.Fill("Where tu_cp_char1 = 'SupplierAddress' and tu_cp_char2 = :2 and processed_flg ='N' AND FILEREFPATHANDFILE = :3 AND PROCESS_INSTANCE=:1 ORDER BY 1,2,to_number(tu_cp_char3),4", GetRecord().PROCESS_INSTANCE.Value, &rs_tu_cp_dt_explHdr(&HDR_LINE).GetRecord(1).TU_CP_CHAR2.Value, &rs_tu_cp_dt_explHdr(&HDR_LINE).GetRecord(1).FILEREFPATHANDFILE.Value);
+   
+   &oVndrAddrScrolCollection = &oTuVndrIdCi.VNDR_ADDR_SCROL;
+   &default_remit_to = 1;
+   For &ADDRESS_LINE = 1 To &rs_tu_cp_dt_explAddress.ActiveRowCount
+      /* Below Code Added by GTOKALA Ticket#6183 */
+      &vaAddressActive = &rs_tu_cp_dt_explAddress(&ADDRESS_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierAddress" | "EFF_STATUS"))][2])).Value;
+      /* Above Code Added by GTOKALA Ticket#6183 */
+      &vaAddressSeq = &rs_tu_cp_dt_explAddress(&ADDRESS_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierAddress" | "ADDRESS_SEQ_NUM"))][2])).Value;
+      rem break if there is no address line;
+      /* #6183, 1/27/2022, Madhu Boddupalli - Start */
+      rem If None(&vaAddressSeq) Or Upper(&vaAddressActive) = "FALSE" Then /* Code Added by GTOKALA */
+         rem &oLog.Logit("***No Address Line");
+      If All(&vaAddressSeq) And
+            Upper(&vaAddressActive) = "TRUE" Then
+         /* #6183, 1/27/2022, Madhu Boddupalli - End */
+         
+         /*   &contactType_Email = &rs_tu_cp_dt_explHdr(&HDR_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierHeader" | "CONTACT_TYPE+EMAILID"))][2])).Value;
+         If All(&contactType_Email) And
+               (&existing) Then
+            SQLExec(SQL.TU_CP_VNDR_EML_UPD_SQL, &contactType_Email, &tVendorId, &sSetId);
+         End-If;*/
+         /* #6183, 1/27/2022, Madhu Boddupalli - Start */
+         rem Break;
+         rem End-If;
+         /* #6183, 1/27/2022, Madhu Boddupalli - End */
+         &oLog.Logit("***Address Line: " | &ADDRESS_LINE);
+         &vaDescr = &rs_tu_cp_dt_explAddress(&ADDRESS_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierAddress" | "DESCR"))][2])).Value;
+         &debugArray.Push("*********Keys*************");
+         &debugArray.Push("&vaAddressSeq" | &vaAddressSeq);
+         &debugArray.Push("*********End-Keys*************");
+         
+         If Not (&existing) Then
+            If &ADDRESS_LINE = 1 Then
+               &oVndrAddrScrol = &oVndrAddrScrolCollection.Item(1);
+            Else
+               &oVndrAddrScrol = &oVndrAddrScrolCollection.insertItem(&oVndrAddrScrolCollection.count);
+            End-If;
+            &oLog.Logit("New Address Sequence: " | &oVndrAddrScrolCollection.count);
+         Else
+            SQLExec("SELECT ADDRESS_SEQ_NUM,VNDR_LOC FROM PS_TU_CP_SM_VD_MAP WHERE TU_CP_CHAR1 = :1 ", &vaCoupaKey | "-" | &vaAddressSeq, &psAddressSeq, &psVndrLoc);
+            If &oVndrAddrScrolCollection.ItemByKeys(&psAddressSeq) <> Null Then
+               &oVndrAddrScrol = &oVndrAddrScrolCollection.ItemByKeys(&psAddressSeq);
+               &oLog.Logit("Existing Address Sequence: " | &psAddressSeq);
+            Else
+               &oVndrAddrScrol = &oVndrAddrScrolCollection.insertitem(&oVndrAddrScrolCollection.count);
+               &oLog.Logit("New Address Sequence: " | &oVndrAddrScrolCollection.count);
+            End-If;
+         End-If;
+         &oVndrAddrScrol.DESCR = &vaDescr;
+         &aAddressSeq.Push(&vaCoupaKey | "-" | &vaAddressSeq);
+         &aAddressSeq [&aAddressSeq.Len][2] = &oVndrAddrScrol.address_seq_num;
+         &oVendorAddrCollection = &oVndrAddrScrol.VENDOR_ADDR;
+         &oVendorAddr = &oVendorAddrCollection.Item(1);
+         &psAddressSeq = &oVndrAddrScrol.address_seq_num;
+         
+         If &oVendorAddr.EFFDT_5 = %Date Then
+            &oVendorAddr = &oVendorAddrCollection.Item(1);
+         Else
+            &oVendorAddr = &oVendorAddrCollection.InsertItem(1);
+         End-If;
+         
+         &oVendorAddr.EFFDT_5 = %Date;
+         &oVendorAddr.EFF_STATUS_0 = "A";
+         &sqlparmvad_country = &rs_tu_cp_dt_explAddress(&ADDRESS_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierAddress" | "COUNTRY"))][2])).Value;
+         &sqlparmvad_state = &rs_tu_cp_dt_explAddress(&ADDRESS_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierAddress" | "STATE"))][2])).Value;
+         
+         
+         /* If &default_remit_to = 1 Then
+         If &separate_remit_to = "Y" Then
+            &default_remit_to = &psAddressSeq;
+         End-If;
+      End-If;*/
+         /****/
+         &debugArray.Push(&sqlparmvad_country);
+         &debugArray.Push(&sqlparmvad_state);
+         /****/
+         
+         SQLExec("select country from ps_country_tbl where upper(descr) = :1", Upper(&sqlparmvad_country), &vad_country);
+         SQLExec("select state from ps_state_tbl where (upper(descr) = :1 OR STATE = :1) AND COUNTRY = nvl(:2,'USA')", Upper(&sqlparmvad_state), &vad_country, &vad_state);
+         
+         
+         If None(&vad_country) Then
+            &oLog.Logit("*****No Country Code " | &vad_country);
+            GetRecord().AE_APPSTATUS.Value = 1;
+         Else
+            &oVendorAddr.COUNTRY = &vad_country;
+         End-If;
+         &defaultAddress1 = Left(&rs_tu_cp_dt_explAddress(&ADDRESS_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierAddress" | "ADDRESS1"))][2])).Value, 55);
+         If None(&defaultAddress1) Then
+            &defaultAddress1 = "None";
+         End-If;
+         &oVendorAddr.ADDRESS1 = &defaultAddress1;
+         &oVendorAddr.ADDRESS2 = Substring(&rs_tu_cp_dt_explAddress(&ADDRESS_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierAddress" | "ADDRESS1"))][2])).Value, 56, 55);
+         &oVendorAddr.ADDRESS3 = Left(&rs_tu_cp_dt_explAddress(&ADDRESS_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierAddress" | "ADDRESS3"))][2])).Value, 55);
+         &debugArray.Push(&oVendorAddr.ADDRESS3);
+         &debugArray.Push(&oVendorAddr.ADDRESS2);
+         &debugArray.Push(&oVendorAddr.ADDRESS1);
+         &oVendorAddr.CITY = &rs_tu_cp_dt_explAddress(&ADDRESS_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierAddress" | "CITY"))][2])).Value;;
+         If All(&vad_country) Then
+            If None(&vad_state) Then
+               &oVendorAddr.STATE = Upper(&sqlparmvad_state);
+            Else
+               &oVendorAddr.STATE = &vad_state;
+            End-If;
+         End-If;
+         &oVendorAddr.POSTAL = &rs_tu_cp_dt_explAddress(&ADDRESS_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierAddress" | "POSTAL"))][2])).Value;;
+         /*06192020 Jalaj Geo Code*/
+         If All(&oVendorAddr.POSTAL) Then
+            &oVendorAddr.GEOCODE_LOOKUP_PB = "Y";
+         End-If;
+         /*06192020 Jalaj Geo Code*/
+         &oVendorAddr.NAME1 = " ";
+         &oVendorAddr.NAME2 = " ";
+         /*LSAHOO - Start- Change DBA label to Legal Name*/
+         /*&oVendorAddr.NAME1_WTHD = Substring(&dba, 1, 40);
+      &oVendorAddr.NAME2_WTHD = Substring(&dba, 41, 40);*/
+         &oVendorAddr.NAME1_WTHD = &wthd_name1;
+         &oVendorAddr.NAME2_WTHD = &wthd_name2;
+         /*LSAHOO - End- Change DBA label to Legal Name*/
+         &oVendorAddr.ADDR_field1 = "CH";
+         &contactType_Email = &rs_tu_cp_dt_explHdr(&HDR_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierHeader" | "CONTACT_TYPE+EMAILID"))][2])).Value;
+         &ContactPrimEmail = &rs_tu_cp_dt_explContact(1).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierContact" | "EMAILID"))][2])).Value;;
+         If None(&contactType_Email) Then
+            rem   &oVendorAddr.EMAILID = &ContactPrimEmail;
+         Else
+            &oVendorAddr.EMAILID = &contactType_Email;
+         End-If;
+         
+         /* #6183, 1/27/2022, Madhu Boddupalli - Start */
+      Else
+         /* &oLog.Logit("***Address Line: " | &ADDRESS_LINE); */
+         If Upper(&vaAddressActive) = "FALSE" Then
+            &oLog.Logit("***Address Line: " | &ADDRESS_LINE | "; RTA line status is " | &vaAddressActive | " for the seq number " | &vaAddressSeq);
+            
+            /* #12082 Supplier Address SEQ and Location SEQ should be 1 to 1 - START. */
+            SQLExec("SELECT SETID, VENDOR_ID, ADDRESS_SEQ_NUM, VNDR_LOC FROM PS_TU_CP_SM_VD_MAP WHERE TU_CP_CHAR1 = :1 ", &vaCoupaKey | "-" | &vaAddressSeq, &psSetID, &psVndrID, &psAddressSeq, &psVndrLoc);
+            &oLog.Logit("MAPPING: " | &vaCoupaKey | "-" | &vaAddressSeq | " ; " | &psSetID | " ; " | &psVndrID | " ; " | &psAddressSeq | " ; " | &psVndrLoc);
+            
+            If &oVndrAddrScrolCollection.ItemByKeys(&psAddressSeq) <> Null Then /* ADDR SEQ NUM existed In PS */
+               
+               SQLExec("select A.EFF_STATUS from PS_VENDOR_ADDR A where A.SETID = :1 and A.VENDOR_ID = :2 and A.ADDRESS_SEQ_NUM = :3 and A.EFFDT = (select max(ADDR.EFFDT) from PS_VENDOR_ADDR ADDR where A.SETID = ADDR.SETID and A.VENDOR_ID = ADDR.VENDOR_ID and A.ADDRESS_SEQ_NUM = ADDR.ADDRESS_SEQ_NUM and ADDR.EFFDT <= :4)", &psSetID, &psVndrID, &psAddressSeq, %Date, &psAddEffStatus);
+               /*&oLog.Logit(" address seq " | &psAddressSeq | " from mapping existed on VENDOR_ADDR.EFF_STATUS max(EFFDT): " | &psAddEffStatus);*/
+               &oLog.Logit("*** no update on FALSE RTA address seq number " | &vaAddressSeq | "; PS seq " | &psAddressSeq);
+            Else
+               /* ADDR SEQ NUM not existed in PS >> &oVndrAddrScrolCollection.ItemByKeys(&psAddressSeq) is NULL. */
+               &oLog.Logit("*** no action on FALSE RTA address seq number " | &vaAddressSeq);
+            End-If;
+            /* #12082 Supplier Address SEQ and Location SEQ should be 1 to 1 - END. */
+            
+         End-If;
+      End-If;
+      /* #6183, 1/27/2022, Madhu Boddupalli - End */
+      
+   End-For;
+   
+   Local boolean &noBankDefaultSoFar = True;
+   &oVndrLocScrolCollection = &oTuVndrIdCi.VNDR_LOC_SCROL;
+   
+   &rta_active_loc_num = 0; /* #6183, 1/27/2022, Madhu Boddupalli, Field to count active RTA rows */
+   
+   For &LOCATION_LINE = 1 To &rs_tu_cp_dt_explLocation.ActiveRowCount
+      /* #6183, 1/27/2022, Madhu Boddupalli - Start */
+      rem &oLog.Logit("***Location Line: " | &LOCATION_LINE);
+      &rta_active_loc_num = &rta_active_loc_num + 1;
+      /* #6183, 1/27/2022, Madhu Boddupalli - End */
+      
+      /* #12082 Supplier Address SEQ and Location SEQ should be 1 to 1 - START. */
+      &loc_seq = &LOCATION_LINE;
+      &oLog.Logit("*** << LOCATION LOOP STARTED >> &LOCATION_LINE & &loc_seq: " | &LOCATION_LINE | " & " | &loc_seq);
+      /* #12082 Supplier Address SEQ and Location SEQ should be 1 to 1 - END. */
+      
+      /* Below Code Added by GTOKALA Ticket#6183 */
+      
+      &vaAddressActive = &rs_tu_cp_dt_explLocation(&LOCATION_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierAddress" | "EFF_STATUS"))][2])).Value;
+      
+      /* Above Code Added by GTOKALA Ticket#6183 */
+      
+      &vaAddressSeq = &rs_tu_cp_dt_explLocation(&LOCATION_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierAddress" | "ADDRESS_SEQ_NUM"))][2])).Value;
+      &vaDescr = &rs_tu_cp_dt_explLocation(&LOCATION_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierAddress" | "VNDR_ADDRESS_TYPE"))][2])).Value;
+      &vaCoupaKey = &rs_tu_cp_dt_explHdr(&HDR_LINE).GetRecord(1).TU_CP_CHAR2.Value | "-" | &rs_tu_cp_dt_explHdr(&HDR_LINE).GetRecord(1).TU_CP_CHAR3.Value;
+      SQLExec("SELECT SETID, VENDOR_ID, ADDRESS_SEQ_NUM,VNDR_LOC,BANK_ACCT_SEQ_NBR FROM PS_TU_CP_SM_VD_MAP WHERE TU_CP_CHAR1 = :1 ", &vaCoupaKey | "-" | &vaAddressSeq, &psSetID, &psVndrID, &psAddressSeq, &psVndrLoc, &psBankSeqNum);
+      
+      /* #12082 Supplier Address SEQ and Location SEQ should be 1 to 1 - START. */
+      &oLog.Logit("MAPPING: " | &vaCoupaKey | "-" | &vaAddressSeq | " ; " | &psSetID | " ; " | &psVndrID | " ; " | &psAddressSeq | " ; " | &psVndrLoc);
+      
+      If All(&psAddressSeq) Then
+         If &LOCATION_LINE = 1 And
+               &psAddressSeq = 1 Then
+            If &psVndrLoc <> "1" Then
+               SQLExec("select L.REMIT_ADDR_SEQ_NUM from PS_VENDOR_LOC L where L.SETID = :1 and L.VENDOR_ID = :2 and L.VNDR_LOC = :3 and L.EFFDT = (select max(LOC.EFFDT) from PS_VENDOR_LOC LOC where L.SETID = LOC.SETID and L.VENDOR_ID = LOC.VENDOR_ID and L.VNDR_LOC = LOC.VNDR_LOC and LOC.EFFDT <= :4)", &psSetID, &psVndrID, &psVndrLoc, %Date, &psLocRemitAddrSeq);
+               If &psLocRemitAddrSeq = &psAddressSeq Then
+                  &oLog.Logit(" PS Orginal VNDR_LOC " | &psVndrLoc | " matched MAPPING VNDR_LOC for Seq Number " | &vaCoupaKey | "-" | &vaAddressSeq | " ; PS addr seq " | &psAddressSeq);
+                  /*no action*/
+               End-If;
+            End-If;
+         Else
+            If &psVndrLoc <> &psAddressSeq Then
+               &psVndrLoc = &psAddressSeq;
+            End-If;
+            
+            If &LOCATION_LINE <> &psAddressSeq Then /* Location loop count <> PS mapping addr seq */
+               &loc_seq = &psAddressSeq;
+            End-If;
+         End-If;
+      Else
+         &oLog.Logit(" I am here >> Addr Array ");
+         &fnd = &aAddressSeq.Find(&vaCoupaKey | "-" | &vaAddressSeq);
+         If (&fnd > 0) Then
+            &aAddrSeqNum = &aAddressSeq [&fnd][2];
+            &loc_seq = &aAddrSeqNum;
+            &psVndrLoc = &aAddrSeqNum;
+            &oLog.Logit("Addr Array: " | &vaCoupaKey | "-" | &vaAddressSeq | " ; " | &aAddrSeqNum);
+         End-If;
+      End-If;
+      /* #12082 Supplier Address SEQ and Location SEQ should be 1 to 1 - END. */
+      
+      If None(&psVndrLoc) Then
+         /* #6183, 1/27/2022, Madhu Boddupalli - Start */
+         rem &psVndrLoc = &LOCATION_LINE;
+         /* #12082 commented the following 2 code lines for #6183 */
+         /* &psVndrLoc = &rta_active_loc_num;
+         &oLog.Logit("####&rta_active_loc_num:: " | &rta_active_loc_num); */
+         /* #12082 commented the above 2 code lines for #6183 */
+         /* #6183, 1/27/2022, Madhu Boddupalli - End */
+         
+         /* #12082 Supplier Address SEQ and Location SEQ should be 1 to 1 - START. */
+         &psVndrLoc = &loc_seq;
+         &oLog.Logit("*** In None(&psVndrLoc) *** Location Line &loc_seq: " | &psVndrLoc);
+         /* #12082 Supplier Address SEQ and Location SEQ should be 1 to 1 - END. */
+      End-If;
+      
+      /* #6183, 1/27/2022, Madhu Boddupalli - Start */
+      rem If None(&vaAddressSeq) Or
+            Upper(&vaAddressActive) = "FALSE" Then /* Code Added by GTOKALA Ticket#6183 */
+        rem Break;
+      rem End-If;
+      
+      If All(&vaAddressSeq) And
+            Upper(&vaAddressActive) = "TRUE" Then
+         /* &oLog.Logit("***Location Line: " | &LOCATION_LINE); */
+         /* #6183, 1/27/2022, Madhu Boddupalli - End */
+         
+         &oLog.Logit("***(&vaAddressActive) = TRUE - Location Line &loc_seq: " | &loc_seq);
+         
+         rem If &LOCATION_LINE = 1 Then;
+         If Not (&existing) Then
+            If None(&oVndrLocScrolCollection.Item(1).VNDR_LOC) Then
+               &oVndrLocScrol = &oVndrLocScrolCollection.Item(1);
+            Else
+               &oVndrLocScrol = &oVndrLocScrolCollection.insertitem(&oVndrLocScrolCollection.Count);
+            End-If;
+            &oVndrLocScrol.DFLT = "Y";
+            /* #6183, 1/27/2022, Madhu Boddupalli - Start */
+            rem &oVndrLocScrol.VNDR_LOC = &LOCATION_LINE;
+            rem &oVndrLocScrol.DESCR = "COUPA  Location" | &LOCATION_LINE;
+            /* #12082 commented the following 2 code lines for #6183 */
+            /* &oVndrLocScrol.VNDR_LOC = &rta_active_loc_num;
+            &oVndrLocScrol.DESCR = "COUPA  Location" | &rta_active_loc_num; */
+            /* #12082 commented the above 2 code lines for #6183 */
+            /* #6183, 1/27/2022, Madhu Boddupalli - End */
+            
+            /* #12082 Supplier Address SEQ and Location SEQ should be 1 to 1 - START. */
+            &oVndrLocScrol.VNDR_LOC = &loc_seq;
+            &oVndrLocScrol.DESCR = "COUPA  Location" | &loc_seq;
+            /* #12082 Supplier Address SEQ and Location SEQ should be 1 to 1 - END. */
+         Else
+            If &oVndrLocScrolCollection.ItemByKeys(&psVndrLoc) <> Null Then
+               &oVndrLocScrol = &oVndrLocScrolCollection.ItemByKeys(&psVndrLoc);
+            Else
+               &oVndrLocScrol = &oVndrLocScrolCollection.insertitem(&oVndrLocScrolCollection.Count);
+               /* #6183, 1/27/2022, Madhu Boddupalli - Start */
+               rem &oVndrLocScrol.VNDR_LOC = &LOCATION_LINE;
+               rem &oVndrLocScrol.DESCR = "COUPA  Location" | &LOCATION_LINE;
+               /* #12082 commented the following 2 code lines for #6183 */
+               /* &oVndrLocScrol.VNDR_LOC = &rta_active_loc_num;
+               &oVndrLocScrol.DESCR = "COUPA  Location" | &rta_active_loc_num; */
+               /* #12082 commented the above 2 code lines for #6183 */
+               /* #6183, 1/27/2022, Madhu Boddupalli - End */
+               
+               /* #12082 Supplier Address SEQ and Location SEQ should be 1 to 1 - START. */
+               &oVndrLocScrol.VNDR_LOC = &loc_seq;
+               &oVndrLocScrol.DESCR = "COUPA  Location" | &loc_seq;
+               /* #12082 Supplier Address SEQ and Location SEQ should be 1 to 1 - END. */
+            End-If;
+         End-If;
+         rem  End-If;
+         &oVendorLocCollection = &oVndrLocScrol.VENDOR_LOC;
+         &oVendorLoc = &oVendorLocCollection.Item(1);
+         If &oVendorLoc.EFFDT = %Date Then
+            &oVendorLoc = &oVendorLocCollection.Item(1);
+         Else
+            &oVendorLoc = &oVendorLocCollection.InsertItem(1);
+            &oVendorLoc.EFFDT = %Date;
+         End-If;
+         
+         &oVendorLoc.EFF_STATUS = "A";
+         &oVendorLoc.PRICE_LOC = &oVndrLocScrol.VNDR_LOC;
+         &oVendorLoc.ADDR_SEQ_NUM_ORDR = &oVndrLocScrol.VNDR_LOC;
+         &oVendorLoc.RET_ADDR_SEQ_NUM = &oVndrLocScrol.VNDR_LOC;
+         &oVendorLoc.ADDR_SEQ_NUM_SHFR = &oVndrLocScrol.VNDR_LOC;
+         &oVendorLoc.PRIM_ADDR_SEQ_NUM = &oVndrLocScrol.VNDR_LOC;
+         &oVendorLoc.REMIT_ADDR_SEQ_NUM = &oVndrLocScrol.VNDR_LOC;
+         &pymnt_terms = &rs_tu_cp_dt_explHdr(&HDR_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierHeader" | "PYMNT_TERMS_CD"))][2])).Value;
+         &oLog.LogitDebug("&pymnt_terms: " | &pymnt_terms);
+         If All(&pymnt_terms) Then
+            &oVendorLoc.PYMNT_TERMS_CD = &pymnt_terms;
+         Else
+            If isApacSetId(&sSetid) Then
+               &oVendorLoc.PYMNT_TERMS_CD = "N30";
+               /*Begin - #7387, GLINGA - Default Payment term for LA setid*/
+            Else
+               If isLASetId(&sSetid) Then
+                  &oVendorLoc.PYMNT_TERMS_CD = "N30";
+                  /*End - #7387, GLINGA - Default Payment term for LA setid*/
+               Else
+                  &oVendorLoc.PYMNT_TERMS_CD = "N45";
+                  
+               End-If;
+            End-If;
+         End-If;
+         &oVendorLoc.DISP_METHOD = "EML";
+         Local string &currencyCd = &rs_tu_cp_dt_explHdr(&HDR_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierHeader" | "CURRENCY_CD"))][2])).Value;;
+         If All(&currencyCd) Then
+            &oVendorLoc.CURRENCY_CD = &currencyCd;
+            &oVendorLoc.CUR_RT_TYPE = "AVG";
+         End-If;
+         
+         /* Below Code commented by  GTOKALA Ticket#6372 */
+         Rem &oVendorLoc.VCHR_APPRVL_FLG = "P";
+         
+         /* Below Code Added by  GTOKALA Ticket#6372 */
+         &oVendorLoc.VCHR_APPRVL_FLG = "D";
+         /* Above Code Added by  GTOKALA Ticket#6372 */
+         &oVndrBankAcctCollection = &oVendorLoc.VNDR_BANK_ACCT;
+         
+         &bank_acct_num = &rs_tu_cp_dt_explLocation(&LOCATION_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierAddress" | "BANK_ACCOUNT_NUM"))][2])).Value;
+         &oVndrBankAcct = Null;
+         
+         If (&existing) Then
+            For &i_RS_tu_VNDR_bank_acct_N = 1 To &oVndrBankAcctCollection.count
+               &oVndrBankAcct = &oVndrBankAcctCollection.item(&i_RS_tu_VNDR_bank_acct_N);
+               If &oVndrBankAcct.bank_acct_seq_nbr = &psBankSeqNum Then
+                  &debugArray.Push("Refresh Bank Account Info");
+                  Break;
+               End-If;
+            End-For;
+         Else
+            &oVndrBankAcct = Null;
+         End-If;
+         If &oVndrBankAcct <> Null Then
+            /*For &i_RS_tu_VNDR_bank_acct_N = &oVndrBankAcctCollection.count To 1 Step - 1
+               &oVndrBankAcctCollection.Deleteitem(&i_RS_tu_VNDR_bank_acct_N);
+            End-For;*/
+            &oLog.LogitDebug(&oVndrBankAcct.bank_acct_seq_nbr | " :&oVndrBankAcct.bank_acct_seq_nbr");
+         Else
+            /* If &oVndrBankAcctCollection.Item(1).BANK_ACCOUNT_NUM <> "" Then
+               &oVndrBankAcct = &oVndrBankAcctCollection.insertItem(&oVndrBankAcctCollection.count);
+            Else
+               &oVndrBankAcct = &oVndrBankAcctCollection.Item(1);
+            End-If;*/
+            rem &oVndrBankAcct = &oVndrBankAcctCollection.insertItem(&oVndrBankAcctCollection.count);
+            &oVndrBankAcct = &oVndrBankAcctCollection.Item(1);
+            &debugArray.Push("Create Bank Account Info");
+         End-If;
+         rem  End-If;
+         
+         &sqlparam_country = &rs_tu_cp_dt_explLocation(&LOCATION_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierAddress" | "BANK_COUNTRY"))][2])).Value;;;
+         &sqlparam_state = &rs_tu_cp_dt_explLocation(&LOCATION_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierAddress" | "BANK_STATE"))][2])).Value;;;
+         &debugArray.Push("&sqlparam_country" | &sqlparam_country);
+         &debugArray.Push("&sqlparam_state" | &sqlparam_state);
+         SQLExec("select country from ps_country_tbl where upper(descr) = :1", Upper(&sqlparam_country), &country);
+         SQLExec("select state from ps_state_tbl where upper(descr) = :1 or state = :1 ", Upper(&sqlparam_state), &state);
+         &oLog.Logit("&sqlparam_country: " | &sqlparam_country);
+         &oLog.Logit("&sqlparam_state: " | &sqlparam_state);
+         
+         &sortCode = &rs_tu_cp_dt_explLocation(&LOCATION_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierAddress" | "DESCR_BANK"))][2])).Value;
+         &ifscIndia = &rs_tu_cp_dt_explLocation(&LOCATION_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierAddress" | "IFSC"))][2])).Value;
+         &bankAddress = &rs_tu_cp_dt_explLocation(&LOCATION_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierAddress" | "BANK_ADDRESS1"))][2])).Value;
+         &debugArray.Push("&bankAddress: " | &bankAddress);
+         &debugArray.Push("&sortCode" | &sortCode);
+         &debugArray.Push("&ifscIndia" | &ifscIndia);
+         &oLog.Logit("&bankAddress: " | &bankAddress);
+         &oLog.Logit("&sortCode: " | &sortCode);
+         &oLog.Logit("&ifscIndia: " | &ifscIndia);
+         &bsbAustralia = False; /* AMAK 08/17/2021 SR #6057 Coupa Asia Hypercare Updates: to initiate &bsbAustralia value to prevent When-Other logic for non-Australia Bank Country Supplier with sortcode falls under &bsbAustralia logic. */
+         If None(&sortCode) Then
+            &sortCode = &rs_tu_cp_dt_explLocation(&LOCATION_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierAddress" | "BSB-NUMBER-AUSTRALIA"))][2])).Value;
+            &bsbAustralia = True;
+         Else
+            If None(&sortCode) Then
+               &sortCode = &rs_tu_cp_dt_explLocation(&LOCATION_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierAddress" | "IFSC-INDIA"))][2])).Value;
+            End-If;
+         End-If;
+         &oVndrBankAcct.DESCR = &sortCode;
+         &bankIdQual = &rs_tu_cp_dt_explLocation(&LOCATION_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierAddress" | "BANK_ID_QUAL+BANK_ID_NUM"))][2])).Value;
+         &oVndrBankAcct.CITY = &rs_tu_cp_dt_explLocation(&LOCATION_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierAddress" | "BANK_CITY"))][2])).Value;;;;
+         &oVndrBankAcct.STATE = &state;
+         &oVndrBankAcct.POSTAL = &rs_tu_cp_dt_explLocation(&LOCATION_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierAddress" | "BANK_POSTAL"))][2])).Value;;;
+         &oVndrBankAcct.COUNTRY = &country;
+         
+         &oVndrBankAcct.BANK_ACCOUNT_NUM = &rs_tu_cp_dt_explLocation(&LOCATION_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierAddress" | "BANK_ACCOUNT_NUM"))][2])).Value;;;
+         &bankAcctType = &rs_tu_cp_dt_explLocation(&LOCATION_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierAddress" | "BANK_ACCT_TYPE"))][2])).Value;
+         
+         &oLog.Logit("&bankIdQual: " | &bankIdQual);
+         &oLog.Logit("&state: " | &state);
+         &oLog.Logit("&country: " | &country);
+         
+         /* #9672, Madhu Boddupalli - Added logic for Current account type - Start */
+         /* Evaluate Right(&bankAcctType, 1)	
+         When "3"
+            &oVndrBankAcct.BANK_ACCT_TYPE = "03";
+         When "2"
+            &oVndrBankAcct.BANK_ACCT_TYPE = "02";
+         When-Other
+            &oVndrBankAcct.BANK_ACCT_TYPE = " ";
+         End-Evaluate;*/
+         
+         Evaluate Right(&bankAcctType, 2)
+         When "03"
+            &oVndrBankAcct.BANK_ACCT_TYPE = "03";
+         When "02"
+            &oVndrBankAcct.BANK_ACCT_TYPE = "02";
+         When "CA"
+            &oVndrBankAcct.BANK_ACCT_TYPE = "CA";
+         When-Other
+            &oVndrBankAcct.BANK_ACCT_TYPE = " ";
+         End-Evaluate;
+         /* #9672, Madhu Boddupalli - Added logic for Current account type - End */
+         
+         &DFINumQual = &rs_tu_cp_dt_explLocation(&LOCATION_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierAddress" | "DFI_ID_QUAL+DFI_ID_NUM"))][2])).Value;
+         &transitInstitutionNumber = &rs_tu_cp_dt_explLocation(&LOCATION_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierAddress" | "TRANSIT+INSTITUTE"))][2])).Value;
+         /***********************Asia********************************/
+         &bic = &rs_tu_cp_dt_explLocation(&LOCATION_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierAddress" | "BIC"))][2])).Value;
+         &intermedPayMessage = &rs_tu_cp_dt_explLocation(&LOCATION_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierAddress" | "INTRMED_PYMNT_MSG"))][2])).Value;
+         &aba = &rs_tu_cp_dt_explLocation(&LOCATION_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierAddress" | "intermediary_aba_number"))][2])).Value;
+         
+         &oLog.Logit("&DFINumQual: " | &DFINumQual);
+         &oLog.Logit("&transitInstitutionNumber: " | &transitInstitutionNumber);
+         &oLog.Logit("&bic: " | &bic);
+         &oLog.Logit("&intermedPayMessage: " | &intermedPayMessage);
+         &oLog.Logit("&aba: " | &aba);
+         /***
+'Coupa field 'intermediary_bank_name'
+When Intermediary information is populated:
+
+Set Complex Routing Flag on PS_VENDOR_PAY 
+EFT_RTNG_FLG  = 'Y'
+
+Set following fields on PS_VNDR_IBANK_ACCT
+INTRMED_SEQ_NO = '1' and increment as needed
+STL_ROUTING_METHOD = '01'
+INTRM_DFI_ID_QUAL = based on Intermediary Bank Code type provided
+***/
+         /***********************Asia********************************/
+         rem &oVndrBankAcct.DFI_ID_QUAL = Left(&DFINumQual, 2);
+         &debugArray.Push("&DFINumQual: " | &DFINumQual);
+         &debugArray.Push("&bankIdQual: " | &bankIdQual);
+         &debugArray.Push("Upper(&country): " | Upper(&country));
+         &debugArray.Push("&sortCode" | &sortCode);
+         &debugArray.Push("&transitInstitutionNumber=" | &transitInstitutionNumber);
+         &debugArray.Push("bank account num=" | &oVndrBankAcct.BANK_ACCOUNT_NUM);
+         SQLExec("SELECT BANK_ID_QUAL FROM PS_BNK_ID_QUAL_VW WHERE COUNTRY =:1", &country, &BANK_ID_QUAL);
+         &oVndrBankAcct.BANK_ID_QUAL = &BANK_ID_QUAL;
+         
+         Evaluate Upper(&country)
+         When "CAN"
+            rem &oVndrBankAcct.BNK_ID_NBR = Right(&bankIdQual, 4);
+            rem Jalaj 12312020 Ticket#3690;
+            rem &oVndrBankAcct.DFI_ID_QUAL = "04"; /* #11479, Madhu Boddupalli - commented the statement - Start/End */
+            rem &oVndrBankAcct.BNK_ID_NBR = Substring(&bankIdQual, 1, Len(&bankIdQual) - 5);
+            rem Jalaj 02012020 in case if the routing number is more than 9 characters;
+            &bankId = Substring(&bankIdQual, 1, 4);
+            &bankId = Rept("0", 4 - Len(&bankId)) | &bankId;
+            &oVndrBankAcct.BNK_ID_NBR = &bankId;
+            /* #11479, Madhu Boddupalli - Populate SWIFT code as DFI ID and DFI ID qualifier - Start */
+            rem &oVndrBankAcct.DFI_ID_NUM = &oVndrBankAcct.BNK_ID_NBR;
+            If All(&DFINumQual) Then
+               &oVndrBankAcct.DFI_ID_QUAL = "02";
+               &oVndrBankAcct.DFI_ID_NUM = &DFINumQual;
+            Else
+               &oVndrBankAcct.DFI_ID_QUAL = "04";
+               /* #12475, 06/21/2023, Madhu Boddupalli - DFIID = Branch ID + Bank ID - Start */
+               rem &oVndrBankAcct.DFI_ID_NUM = &oVndrBankAcct.BNK_ID_NBR;
+               &oVndrBankAcct.DFI_ID_NUM = Right(&bankIdQual, 5) | &oVndrBankAcct.BNK_ID_NBR;
+               /* #12475, 06/21/2023, Madhu Boddupalli - DFIID = Branch ID + Bank ID - End */
+            End-If;
+            /* #11479, Madhu Boddupalli - Populate SWIFT code as DFI ID and DFI ID qualifier - End */
+            &oVndrBankAcct.BRANCH_ID = Right(&bankIdQual, 5);
+            
+            If All(&transitInstitutionNumber) Then
+               REM &oVndrBankAcct.DFI_ID_QUAL = "02";
+               rem &oVndrBankAcct.DFI_ID_QUAL = "04"; /* #11479, Madhu Boddupalli - commented the statement - Start/End */
+               rem &oVndrBankAcct.DFI_ID_NUM = Right(&DFINumQual, 11);
+               &branchId = Substring(&transitInstitutionNumber, 1, 5);
+               &bankId = Right(&transitInstitutionNumber, 3);
+               &oVndrBankAcct.BNK_ID_NBR = Rept("0", 4 - Len(&bankId)) | &bankId;
+               /* #11479, Madhu Boddupalli - Populate SWIFT code as DFI ID and DFI ID qualifier - Start */
+               rem &oVndrBankAcct.DFI_ID_NUM = &oVndrBankAcct.BNK_ID_NBR;
+               If All(&DFINumQual) Then
+                  &oVndrBankAcct.DFI_ID_QUAL = "02";
+                  &oVndrBankAcct.DFI_ID_NUM = &DFINumQual;
+               Else
+                  &oVndrBankAcct.DFI_ID_QUAL = "04";
+                  /* #12475, 06/21/2023, Madhu Boddupalli - DFIID = Branch ID + Bank ID - Start */
+                  rem &oVndrBankAcct.DFI_ID_NUM = &oVndrBankAcct.BNK_ID_NBR;
+                  &oVndrBankAcct.DFI_ID_NUM = &branchId | &oVndrBankAcct.BNK_ID_NBR;
+                  /* #12475, 06/21/2023, Madhu Boddupalli - DFIID = Branch ID + Bank ID - End */
+               End-If;
+               /* #11479, Madhu Boddupalli - Populate SWIFT code as DFI ID and DFI ID qualifier - End */
+               
+               &oVndrBankAcct.BRANCH_ID = &branchId;
+            End-If;
+            Break;
+         When "USA"
+            &oVndrBankAcct.BNK_ID_NBR = Right(&bankIdQual, 9);
+            If All(&DFINumQual) Then
+               &oVndrBankAcct.DFI_ID_QUAL = "02";
+               &oVndrBankAcct.DFI_ID_NUM = &DFINumQual;
+            Else
+               &oVndrBankAcct.DFI_ID_QUAL = "01";
+               &oVndrBankAcct.DFI_ID_NUM = &bankIdQual;
+               &oVndrBankAcct.BRANCH_ID = &bankIdQual;
+               
+            End-If;
+            Break;
+            
+            Break;
+         When-Other
+            
+            /* #9672, Madhu Boddupalli - Neustart/Sontiq project changes - Start */
+            &OrganizationType = &rs_tu_cp_dt_explHdr(&HDR_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierHeader" | "ORGANIZATION_TYPE"))][2])).Value;
+            &class_tin = &rs_tu_cp_dt_explHdr(&HDR_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierHeader" | "WTHD_ENTITY+TIN_TYPE+TIN"))][2])).Value;
+            /* #9672, Madhu Boddupalli - Neustart/Sontiq project changes - End */
+            
+            REM tu 12312020 Jalaj For UKALL to the sort code ;
+            rem tu 01182021 Jalaj replace UKALL with a dynamic configuration;
+            
+            &debugArray.Push("&sSetid=" | &sSetid);
+            SQLExec("SELECT 'X' FROM PS_STRINGS_TBL WHERE PROGRAM_ID = 'TU_P2P_1' AND ((STRING_ID LIKE 'SETID_SCD%' AND STRING_TEXT = :1) OR (STRING_ID LIKE 'COUNTRY_SCD%' AND STRING_TEXT = :2))", &sSetid, Upper(&country), &followSortCodeLogic);
+            If All(&followSortCodeLogic) Then
+               &debugArray.Push("&followSortCodeLogic: " | &followSortCodeLogic);
+               
+               If All(&bankIdQual) Then
+                  &oVndrBankAcct.DFI_ID_QUAL = "02";
+                  &oVndrBankAcct.DFI_ID_NUM = &bankIdQual;
+                  &oVndrBankAcct.BRANCH_ID = Left(&bankIdQual, 5);
+                  &oVndrBankAcct.BNK_ID_NBR = &sortCode;
+                  &oVndrBankAcct.IBAN_ID = &rs_tu_cp_dt_explLocation(&LOCATION_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierAddress" | "IBAN_ID"))][2])).Value;;;
+               Else
+                  If All(&DFINumQual) Then
+                     &debugArray.Push("&DFINumQual: " | &DFINumQual);
+                     
+                     &oVndrBankAcct.DFI_ID_QUAL = "02";
+                     &oVndrBankAcct.DFI_ID_NUM = &DFINumQual;
+                     &oVndrBankAcct.BNK_ID_NBR = &sortCode;
+                     &oVndrBankAcct.IBAN_ID = &rs_tu_cp_dt_explLocation(&LOCATION_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierAddress" | "IBAN_ID"))][2])).Value;;;
+                  Else
+                     &oVndrBankAcct.DFI_ID_QUAL = "ZZ";
+                     /* AMAK 03-18-2021 SR#4728: populated Bank Id Number when only Sort Code is provided on SIM file for SetID(s) on PS_STRINGS_TBL */
+                     &oVndrBankAcct.BNK_ID_NBR = &sortCode;
+                  End-If;
+               End-If;
+            Else
+               /***********Asia*************/
+               &seq = 1;
+               &iBankAcctCollection = &oVendorLoc.VNDR_IBANK_ACCT;
+               &oVendorPayCollection = &oVendorLoc.VENDOR_PAY;
+               &oVendorPayCollection.item(1).EFT_RTNG_FLG = "R";
+               For &iBankAcctCount = &iBankAcctCollection.count To 1 Step - 1
+                  &iBankAcctCollection.Deleteitem(&iBankAcctCount);
+               End-For;
+               &iBankAcct = &iBankAcctCollection.item(1);
+               If All(&bic) Then
+                  
+                  
+                  
+                  &iBankAcct.BANK_ACCT_SEQ_NBR = 1;
+                  &iBankAcct.INTRMED_SEQ_NO = &seq;
+                  &iBankAcct.STL_ROUTING_METHOD = "01";
+                  &iBankAcct.INTRMED_PYMNT_MSG = &intermedPayMessage;
+                  &iBankAcct.INTRM_DFI_ID_QUAL = "02";
+                  &iBankAcct.INTRMED_DFI_ID = &bic;
+                  
+                  &seq = &seq + 1;
+               End-If;
+               If All(&aba) Then
+                  &debugArray.Push("&aba: " | &aba);
+                  If &seq > 1 Then
+                     &iBankAcct = &iBankAcctCollection.insertitem(&iBankAcctCollection.count);
+                     
+                  End-If;
+                  &iBankAcct.INTRMED_SEQ_NO = &seq;
+                  &iBankAcct.BANK_ACCT_SEQ_NBR = 1;
+                  &iBankAcct.STL_ROUTING_METHOD = "01";
+                  &iBankAcct.INTRMED_PYMNT_MSG = &intermedPayMessage;
+                  &iBankAcct.INTRM_DFI_ID_QUAL = "01";
+                  &iBankAcct.INTRMED_DFI_ID = &aba;
+                  &seq = &seq + 1;
+               End-If;
+               
+               /**BENEF_BRANCH
+----------------------
+DFI_ID_QUAL
+DFI_ID_NUM
+
+INTRMED_DFI_ID */
+               REM Else;
+               /*******************************/
+               If All(&DFINumQual) Then
+                  &oVndrBankAcct.DFI_ID_QUAL = "02";
+                  rem Jalaj TU#3288 11302020 Modified assignment from bankIdQual to DFIIdQUal;
+                  &oVndrBankAcct.DFI_ID_NUM = &DFINumQual;
+                  rem Jalaj TU#3288 11302020 Fixed Mapping ;
+                  &oVndrBankAcct.BRANCH_ID = Right(&bankIdQual, 5);
+                  rem Jalaj TU#3288 11302020 Fixed Mapping;
+                  rem &oVndrBankAcct.BNK_ID_NBR = Substring(&bankIdQual, 1, Len(&bankIdQual) - 5);;
+                  rem 01302021 Jalaj Assign the value as it is;
+                  &oVndrBankAcct.BNK_ID_NBR = &bankIdQual;
+                  rem Jalaj TU#3288 01/05/2021 Map Benef Branch;
+                  &oVndrBankAcct.BENEF_BRANCH = &DFINumQual;
+                  rem Jalaj TU#01302021;
+                  &oVndrBankAcct.IBAN_ID = &rs_tu_cp_dt_explLocation(&LOCATION_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierAddress" | "IBAN_ID"))][2])).Value;;;
+               Else
+                  &oVndrBankAcct.DFI_ID_QUAL = "ZZ";
+               End-If;
+            End-If;
+            If (&bsbAustralia) Then
+               &oLog.LogitDebug("inside &bsbAustralia if statement when &bsbAustralia: " | &bsbAustralia); /*AMAK 08/18/2021 SR #6057 Coupa Asia Hypercare Updates: testing due to UK sortcode error.*/
+               &oVndrBankAcct.BRANCH_ID = Right(&sortCode, 3);
+               &oVndrBankAcct.BNK_ID_NBR = Left(&sortCode, 3);;
+            End-If;
+            If isIndiaSetId(&sSetid) Then
+               &oVndrBankAcct.BENEF_BRANCH = &bankAddress;
+               &oVndrBankAcct.DFI_ID_QUAL = "ZZ";
+               &oVndrBankAcct.DFI_ID_NUM = &ifscIndia;
+            Else
+               /* #7088, 2/1/2022, Madhu Boddupalli - Start */
+               rem If &sSetid = "27100" Or &sSetid = "27500" Or &sSetid = "27000" Then ;
+               If isBankDtlsInTwoCols(&sSetid) Then
+                  /* #7088, 2/1/2022, Madhu Boddupalli - End */
+                  &oVndrBankAcct.BENEF_BRANCH = " ";
+                  /* #7088, 2/1/2022, Madhu Boddupalli - Start */
+                  rem &oVndrBankAcct.BNK_ID_NBR = Substring(&oVndrBankAcct.BANK_ACCOUNT_NUM, 1, 3);
+                  rem &oVndrBankAcct.BRANCH_ID = Substring(&oVndrBankAcct.BANK_ACCOUNT_NUM, 4, 3);
+                  rem &oVndrBankAcct.BANK_ACCOUNT_NUM = Substring(&oVndrBankAcct.BANK_ACCOUNT_NUM, 7, 29);
+                  &bank_code = &rs_tu_cp_dt_explLocation(&LOCATION_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierAddress" | "BNK_ID_NBR+BRANCH_ID"))][2])).Value;
+                  If All(&bank_code) Or
+                        Len(&bank_code) <> 6 Then
+                     &oVndrBankAcct.BNK_ID_NBR = Substring(&bank_code, 1, 3);
+                     &oVndrBankAcct.BRANCH_ID = Substring(&bank_code, 4, 3);
+                     &oVndrBankAcct.BANK_ACCOUNT_NUM = &oVndrBankAcct.BANK_ACCOUNT_NUM;
+                  Else
+                     &oLog.LogitDebug("The bank code must be 6 chars for " | &sSetid);
+                  End-If;
+                  /* #7088, 2/1/2022, Madhu Boddupalli - End */
+               Else
+                  If Substring(&sSetid, 1, 2) = "27" Then
+                     &oVndrBankAcct.BENEF_BRANCH = " ";
+                     /* #9672, Madhu Boddupalli - Colombia BAU change - Assign Bank Code - Start */
+                  Else
+                     If isLASetId(&sSetid) And
+                           All(&OrganizationType) Then
+                        &bank_code = &rs_tu_cp_dt_explLocation(&LOCATION_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierAddress" | "BNK_ID_NBR+BRANCH_ID"))][2])).Value;
+                        &oLog.Logit("&bank_code " | &bank_code);
+                        &oVndrBankAcct.BNK_ID_NBR = &bank_code;
+                        /* #11097, 4/13/2022, Madhu Boddupalli, Populate routing number as Bank ID for Puerto Rico bank country - Start */
+                     Else
+                        If Upper(&country) = "PRI" Then
+                           &oLog.LogitDebug("Populate Routing Number as Bank ID for Puerto Rico bank country.");
+                           &oVndrBankAcct.BNK_ID_NBR = &bankIdQual;
+                           &oVndrBankAcct.DFI_ID_QUAL = "ZZ"; /* The current logic populates ZZ as a qualifier even if the line is removed */
+                           &oVndrBankAcct.DFI_ID_NUM = &bankIdQual;
+                        End-If;
+                        /* #11097, 4/13/2022, Madhu Boddupalli, Populate routing number as Bank ID for Puerto Rico bank country - End */
+                        
+                     End-If;
+                     /* #9672, Madhu Boddupalli - Colombia BAU change - Assign Bank Code - End */
+                  End-If;
+               End-If;
+            End-If;
+         End-Evaluate;
+         If All(&oVndrBankAcct.BANK_ACCOUNT_NUM) And
+               (&noBankDefaultSoFar) Then
+            rem &oVndrBankAcct.default_ind = "Y";
+            &noBankDefaultSoFar = False;
+            &oVndrLocScrol.DFLT = "Y";
+            rem &oVendorLoc.REMIT_ADDR_SEQ_NUM = &LOCATION_LINE;
+         End-If;
+         
+         &oVndrBankAcct.BENEFICIARY_BANK = &rs_tu_cp_dt_explLocation(&LOCATION_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierAddress" | "BENEFICIARY_BANK"))][2])).Value;;;
+         REM &oVndrBankAcct.BENEF_BRANCH = &rs_tu_cp_dt_explAddress(&ADDRESS_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierAddress" | "POSTAL"))][2])).Value;;;
+         rem Jalaj 01302021 move up to assign only for NON North American countries;
+         rem &oVndrBankAcct.IBAN_ID = &rs_tu_cp_dt_explLocation(&LOCATION_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierAddress" | "IBAN_ID"))][2])).Value;;;
+         
+         /*Begin - #7387, GLINGA - VENDOR_TYPE for LAALL use only*/
+         rem ***** Set VENDOR_TYPE Collection Field Properties -- Parent: VENDOR_LOC Collection *****;
+         
+         /* #9082, Madhu Boddupalli - Neustart/Sontiq project changes - Start */
+         rem If isLASetId(&sSetid) Then;
+         If isLASetId(&sSetid) And
+               All(&OrganizationType) Then
+            /* #9082, Madhu Boddupalli - Neustart/Sontiq project changes - End */
+            &oVendorTypeCollection = &oVendorLoc.VENDOR_TYPE;
+            Local integer &i3731;
+            For &i3731 = 1 To &oVendorTypeCollection.Count;
+               &oVendorType = &oVendorTypeCollection.Item(&i3731);
+               /* #9082, Madhu Boddupalli - Neustart/Sontiq project changes - Commented and moved to top - Start */
+               rem &OrganizationType = &rs_tu_cp_dt_explHdr(&HDR_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierHeader" | "ORGANIZATION_TYPE"))][2])).Value;
+               /* #9082, Madhu Boddupalli - Neustart/Sontiq project changes - End */
+               
+               SQLExec("SELECT SUBSTR(STRING_ID,1,3) FROM PS_STRINGS_TBL WHERE PROGRAM_ID = 'TU_P2P_1' AND STRING_TEXT = :1 ", &OrganizationType, &Vendor_Type);
+               &oVendorType.VENDOR_TYPE_1 = &Vendor_Type;
+               &oVendorType.VNDR_SERVICE_TYPE = Substring(&class_tin, Find("-", &class_tin) + 1, Len(&class_tin));
+            End-For;
+         End-If;
+         /*End - #7387, GLINGA - VENDOR_TYPE for LAALL use only*/
+         
+         &oVndrEmailPayMthdCollection = &oVendorLoc.EMAIL_PAY_MTHD;
+         &payment_method = &rs_tu_cp_dt_explLocation(&LOCATION_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierAddress" | "PYMNT_METHOD"))][2])).Value;;;;
+         If All(&payment_method) Then
+            rem &oVndrEmailPayMthdCollection.Item(1).PYMNT_METHOD = &payment_method;
+            &oVendorPayCollection = &oVendorLoc.VENDOR_PAY;
+            REM &oVendorPayCollection.Item(1).PYMNT_GROUP_CD = "02";
+            &oVendorPayCollection.Item(1).PYMNT_MTHD_FLG = "S";
+            &oVendorPayCollection.Item(1).PYMNT_METHOD = &payment_method;
+            
+            /* #7456, dt 5/13/2022, Madhu Boddupalli, Logic to assign pay group for UKALL - Start */
+            &oLog.Logit("Payment Method: " | &payment_method);
+            If IsPayGroupSetid(&sSetid) Then
+               /* #9672, Madhu Boddupalli - Colombia BAU change - Start */
+               If &sSetid = "UKALL" Then
+                  /* #9672, Madhu Boddupalli - Colombia BAU change - End */
+                  &oLog.Logit("Assign pay group code for the setid " | &sSetid | " (UKALL) supplier.");
+                  Evaluate Upper(&payment_method)
+                  When "EFT"
+                     &oVendorPayCollection.Item(1).PYMNT_GROUP_CD = "01";
+                     Break;
+                  When "CHK"
+                     &oVendorPayCollection.Item(1).PYMNT_GROUP_CD = "05";
+                     Break;
+                  When "WIR"
+                  When "ACH"
+                     &oVendorPayCollection.Item(1).PYMNT_GROUP_CD = "16";
+                     Break;
+                  End-Evaluate;
+                  /* #9672, Madhu Boddupalli - Colombia BAU change - Assign Pay Group based on organization type - Start */
+               Else
+                  If isLASetId(&sSetid) And
+                        All(&OrganizationType) Then
+                     &oLog.Logit("Assign pay group code for the setid " | &sSetid | " (Colombian) supplier.");
+                     Evaluate &OrganizationType
+                     When "Corporation"
+                     When "Partnership"
+                     When "Individual"
+                        &oVendorPayCollection.Item(1).PYMNT_GROUP_CD = "40";
+                        &oLog.Logit("LAALL PayGroup - 40");
+                        Break;
+                     When "Foreign Corporation"
+                     When "Foreign Partnership"
+                     When "Foreign Individual"
+                        &oVendorPayCollection.Item(1).PYMNT_GROUP_CD = "20";
+                        &oLog.Logit("LAALL PayGroup - 20");
+                        Break;
+                     End-Evaluate;
+                  End-If;
+               End-If;
+               /* #9672, Madhu Boddupalli - Colombia BAU change - Assign Pay Group based on organization type - End */
+            End-If;
+            /* #7456, dt 5/13/2022, Madhu Boddupalli, Logic to assign pay group for UKALL - End */
+            
+         End-If;
+         /*~Transunion Jalaj Mehta 11012020*/
+         If All(&paymentNotificationEmail) Then
+            &oVendorPayCollection = &oVendorLoc.VENDOR_PAY;
+            &oVendorPayCollection.Item(1).EMAIL_ADVICE = "Y";
+            &oVendorPayCollection.Item(1).EMAILID_2 = &paymentNotificationEmail;
+            
+            /* AMAK 10-06-2021 SR# 6494 - Defaulted PYMNT_MEHTOD(s) when &paymentNotificationEmail is entered on SIM for Kyriba Payment Email Notification Process */
+            &oLog.LogitDebug("in &oVendorLoc.EMAIL_PAY_MTHD section");
+            &oVndrEmailPayMthdCollection = &oVendorLoc.EMAIL_PAY_MTHD;
+            For &i_oVndrEmailPayMthdCollection = &oVndrEmailPayMthdCollection.count To 1 Step - 1
+               &oVndrEmailPayMthdCollection.Deleteitem(&i_oVndrEmailPayMthdCollection);
+            End-For;
+            
+            &oVndrEmailPayMthd = &oVndrEmailPayMthdCollection.Item(1);
+            &oVndrEmailPayMthd = &oVndrEmailPayMthdCollection.insertItem(&oVndrEmailPayMthdCollection.Count);
+            &oVndrEmailPayMthd.SEQ_NUM = 1;
+            &oVndrEmailPayMthd.PYMNT_METHOD = "ACH";
+            &oVndrEmailPayMthd = &oVndrEmailPayMthdCollection.insertItem(&oVndrEmailPayMthdCollection.Count);
+            &oVndrEmailPayMthd.SEQ_NUM = 1;
+            &oVndrEmailPayMthd.PYMNT_METHOD = "CHK";
+            &oVndrEmailPayMthd = &oVndrEmailPayMthdCollection.insertItem(&oVndrEmailPayMthdCollection.Count);
+            &oVndrEmailPayMthd.SEQ_NUM = 1;
+            &oVndrEmailPayMthd.PYMNT_METHOD = "EFT";
+            &oVndrEmailPayMthd = &oVndrEmailPayMthdCollection.insertItem(&oVndrEmailPayMthdCollection.Count);
+            &oVndrEmailPayMthd.SEQ_NUM = 1;
+            &oVndrEmailPayMthd.PYMNT_METHOD = "WIR";
+         End-If;
+         
+         REM End-If;
+         
+         rem    If &LOCATION_LINE = 1 Then;
+         
+         &oVendorWthdCollection = &oVendorLoc.VENDOR_WTHD;
+         &oVendorWthdJurCollection = &oVendorLoc.VENDOR_WTHD_JUR;
+         &oVndrLocIdNbrCollection = &oVendorLoc.VNDR_LOC_ID_NBR;
+         For &i_RS_tu_VENDOR_WTHD = &oVendorWthdCollection.count To 1 Step - 1
+            &oVendorWthdCollection.Deleteitem(&i_RS_tu_VENDOR_WTHD);
+         End-For;
+         
+         
+         For &i_RS_tu_VENDOR_W_JUR = &oVendorWthdJurCollection.count To 1 Step - 1
+            &oVendorWthdJurCollection.item(&i_RS_tu_VENDOR_W_JUR).DEFAULT_JUR_FLG = "N";
+            &oVendorWthdJurCollection.Deleteitem(&i_RS_tu_VENDOR_W_JUR);
+         End-For;
+         
+         For &i_RS_tu_VNDR_LC_ID_N = &oVndrLocIdNbrCollection.count To 1 Step - 1
+            &oVndrLocIdNbrCollection.Deleteitem(&i_RS_tu_VNDR_LC_ID_N);
+         End-For;
+         
+         &oVendorWthdCollection.insertitem(1);
+         &oVendorWthdJurCollection.insertitem(1);
+         &oVndrLocIdNbrCollection.insertitem(1);
+         &oVendorWthd = &oVendorWthdCollection.Item(1);
+         &oVndrLocIdNbr = &oVndrLocIdNbrCollection.Item(1);
+         &oVendorWthdJur = &oVendorWthdJurCollection.Item(1);
+         
+         
+         rem &oVendorWthd.ADDRESS_SEQ_NUM = &vaAddressSeq;
+         
+         /* AMAK 04/07/2021 SR# 4771 Begin:
+1 - Coupa Federal (US) Tax Id will use type TIN instead of FED in PeopleSoft.  FEB_TIN is validated for 9 characters in length, and it's notated in Coupa on FEB TAX ID field.
+2 - Coupa International Tax Id will use type FED instead of TIN in PeopleSoft.  INT_TIN can be any length, "FED" value is not delivered and therefore has no validation. 
+3 - If supplier is in a VAT country the International Tax Id will be populated on both the Location Id Numbers and the VAT Registration page. */
+         
+         &fed_tin = &rs_tu_cp_dt_explHdr(&HDR_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierHeader" | "FED_TIN"))][2])).Value;
+         &int_tin = &rs_tu_cp_dt_explHdr(&HDR_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierHeader" | "INT_TIN"))][2])).Value;
+         /* #9082, Madhu Boddupalli - Neustar/Sontiq - DUNS Changes - Start */
+         &duns = &rs_tu_cp_dt_explHdr(&HDR_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierHeader" | "DUNS"))][2])).Value;
+         /* #9082, Madhu Boddupalli - Neustar/Sontiq - DUNS Changes - End */
+         
+         If isIndiaSetId(&setId) Then
+            &int_tin = Substring(LTrim(&int_tin), 1, 15);
+            
+         End-If;
+         /*~Tu Jalaj 11062020 Make Vat Switch Active if There is an International Tin*/
+         /* AMAK 04/07/2021 SR# 4771: updates are for all Suppliers in VAT country.
+                                   To default Registration Country for UK & LT only when no VAT Country found used what's from the PS_STRINGS_TBL setup. */
+         SQLExec("SELECT 'X' FROM PS_STRINGS_TBL WHERE PROGRAM_ID = 'TU_P2P_1' AND STRING_ID LIKE 'SETID_VAT%' AND STRING_TEXT = :1", &sSetid, &setIdWithVAT);
+         If All(&int_tin) And
+               /* All(&setIdWithVAT) And */
+               &LOCATION_LINE = 1 Then
+            &sqlparmvad_country = &rs_tu_cp_dt_explLocation(&LOCATION_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierAddress" | "COUNTRY"))][2])).Value;
+            SQLExec("select country from ps_country_tbl where upper(descr) = :1", Upper(&sqlparmvad_country), &vad_country);
+            SQLExec("SELECT 'X' FROM PS_COUNTRY_VAT_VW WHERE COUNTRY = :1", &vad_country, &vad_country_exists);
+            If All(&vad_country_exists) Or
+                  All(&setIdWithVAT) Or
+                  isIndiaSetId(&sSetid) Then
+               rem TU 2354 Jalaj Asia Implementation 06/11/2021;
+               If isIndiaSetId(&sSetid) Then
+                  &oTuVndrIdCi.VAT_SW = "N";
+               Else
+                  &oTuVndrIdCi.VAT_SW = "Y";
+               End-If;
+               &debugArray.Push("&oTuVndrIdCi.VAT_SW = " | &oTuVndrIdCi.VAT_SW);
+               
+               &vatRegistrationCol = &oTuVndrIdCi.VNDR_VAT_RGSTRN;
+               &vatRegistration = &vatRegistrationCol.item(1);
+               If All(&vad_country_exists) Then
+                  &vatRegistration.COUNTRY = &vad_country;
+                  &debugArray.Push("&vad_country_exists = " | &vatRegistration.COUNTRY);
+               Else
+                  If All(&setIdWithVAT) Then
+                     &vatRegistration.COUNTRY = "GBR";
+                     &debugArray.Push("&setIdWithVAT(default) = " | &vatRegistration.COUNTRY);
+                  Else
+                     /***asia***/
+                  End-If;
+               End-If;
+               &vatRegistration.VAT_RGSTRN_ID_0 = &int_tin;
+               &vatRegistration.home_country_FLG = "Y";
+            End-If;
+         End-If;
+         
+         If All(&fed_tin) Then
+            &tin = Rept("0", 9 - Len(&fed_tin)) | &fed_tin;
+         Else
+            /* &tin = Rept("0", 9 - Len(&int_tin)) | &int_tin; */
+            If All(&int_tin) Then
+               &tin = &int_tin;
+            End-If;
+         End-If;
+         
+         
+         &class_tin = &rs_tu_cp_dt_explHdr(&HDR_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierHeader" | "WTHD_ENTITY+TIN_TYPE+TIN"))][2])).Value;
+         REM &apacWitholding = &rs_tu_cp_dt_explHdr(&HDR_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierHeader" | "withholding_code_classes"))][2])).Value;
+         &apacWitholding = &rs_tu_cp_dt_explHdr(&HDR_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierHeader" | "WITHHOLDING_CODE_CLASSES"))][2])).Value;
+         rem Jalaj 5722 Code fix to witholding class;
+         &arrWthClass = CreateArrayRept("", 0);
+         
+         /* #8646, 6/17/2022, Madhu Boddupalli - Start */
+         /* If isApacSetId(&sSetid) Then*/
+         If isApacSetId(&sSetid) Or
+               isLASetId(&sSetid) Then
+            /* #8646, 6/17/2022, Madhu Boddupalli - End */
+            If Find(";", &apacWitholding) > 1 Then
+               &arrWthClass = Split(&apacWitholding, ";");
+               /*  &wthd_class = Split(&apacWitholding, ";")[2];
+            &wthd_type = Split(&apacWitholding, ";")[1];*/
+            Else
+               &arrWthClass = Split(&apacWitholding | ";", ";");;
+            End-If;
+         Else
+            If All(&class_tin) Then
+               try
+                  
+                  &wthd_class = Split(&class_tin, "-")[2];
+                  &wthd_type = Split(&class_tin, "-")[1];
+                  rem Jalaj 5722 Code fix to witholding class;
+                  &arrWthClass.push(&wthd_class);
+               catch Exception &e
+                  &oLog.Logit("Class is Invalid " | &e.ToString());
+               end-try;
+            End-If;
+         End-If;
+         &oLog.LogitDebug("&wthd_class :  &wthd_type: " | &wthd_class | ":" | &wthd_type);
+         If (Upper(&vendorWithHoldingSwitch) = "Y") Or
+               (isApacSetId(&sSetid)) Then
+            /*Begin - #7387, GLINGA - Withholding values - Project Colombia */
+            /* #9082, Madhu Boddupalli - Neustart/Sontiq project changes - Start */
+            rem If Not isLASetId(&sSetid) Then;
+            If ( Not isLASetId(&sSetid) And
+                  None(&OrganizationType)) And
+                  &sSetid <> "INALL" Then
+               /* #9082, Madhu Boddupalli - Neustart/Sontiq project changes - End */
+               /*End - #7387, GLINGA - Withholding values - Project Colombia */
+               &oLog.Logit("Creating Witholding Line");
+               For &iVWJ = 1 To &arrWthClass.len
+                  &wthd_class = &arrWthClass [&iVWJ];
+                  If All(&wthd_class) And
+                        Upper(&wthd_class) <> Upper("Tax Exempt") Then
+                     &oVendorWthdJur.WTHD_ENTITY = getWitholdingCode(&sSetid); /*asia*/
+                     &oVendorWthdJur.WTHD_TYPE = getWitholdingType(&wthd_type, &sSetid);;
+                     &oVendorWthdJur.WTHD_JUR_CD = getWitholdJurCode(&sSetid);
+                     &oVendorWthdJur.DEFAULT_JUR_FLG = "Y";
+                     &oVendorWthdJur.DEFAULT_CLASS = &wthd_class;
+                     &oVendorWthdJur.WTHD_FLG = "Y";
+                     &oVendorWthdJur.VENDOR_CATEGORY = getVendorCategory(&sSetid);
+                     &oVendorWthdJur = &oVendorWthdJurCollection.insertitem(&oVendorWthdCollection.count);
+                     &oTuVndrIdCi.WTHD_SW_VEN = "Y";
+                  End-If;
+               End-For;
+               &oVendorWthd.WTHD_ENTITY = getWitholdingCode(&sSetid); /*asia*/
+               &oVendorWthd.ADDRESS_SEQ_NUM = 1;
+               &oVendorWthd.TIN_TYPE = "F";
+               rem TU 2354 Jalaj Asia Implementation 06/11/2021;
+               &oVendorWthd.WTHD_CONTROL_NAME = Substring(&oTuVndrIdCi.NAME1, 1, 4);
+               &oVendorWthd.WTHD_PAN_NUM = &panNumber;
+               &oVendorWthd.WTHD_PAN_WARD = getWitholdPanWar(&sSetid);
+               
+               rem TU 2354 Jalaj Asia Implementation 06/11/2021;
+               If &tin <> "000000000" Then
+                  &oVendorWthd.TIN = &tin;
+               End-If;
+               /*Begin - #7387, GLINGA - Withholding values - Project Colombia */
+            End-If;
+            /*End - #7387, GLINGA - Withholding values - Project Colombia */
+         End-If;
+         
+         /* #9082, Madhu Boddupalli - Neustart/Sontiq project changes - Withholding assignment for INALL and LAALL (Costa Rica) - Start */
+         If (&sSetid = "INALL" And
+               Len(RTrim(&apacWitholding)) > 0) Or
+               (isLASetId(&sSetid) And
+                  None(&OrganizationType) And
+                  Len(RTrim(&apacWitholding)) > 0) Then
+            
+            SQLExec("SELECT STRING_TEXT FROM PS_STRINGS_TBL WHERE PROGRAM_ID = 'TU_P2P_1' AND STRING_ID = 'WTHD_ENTITY_" | &sSetid | "'", &INCR_WTHD_ENTITY);
+            &oLog.Logit("Creating Witholding Line for " | &sSetid | "-" | &INCR_WTHD_ENTITY);
+            
+            For &wid = 1 To &arrWthClass.len
+               &wthd_class = &arrWthClass [&wid];
+               SQLExec("SELECT WTHD_TYPE, WTHD_JUR_CD, WTHD_CLASS, VENDOR_CATEGORY FROM PS_WTHD_CATEGORY WHERE WTHD_ENTITY = :1 AND WTHD_CLASS = :2 ORDER BY VENDOR_CATEGORY DESC", &INCR_WTHD_ENTITY, &wthd_class, &INCR_WTHD_TYPE, &INCR_WTHD_JUR_CD, &INCR_WTHD_CLASS, &INCR_VENDOR_CATEGORY);
+               If All(&wthd_class) Then
+                  &oVendorWthdJur.WTHD_ENTITY = &INCR_WTHD_ENTITY;
+                  &oVendorWthdJur.WTHD_TYPE = &INCR_WTHD_TYPE;
+                  &oVendorWthdJur.WTHD_JUR_CD = &INCR_WTHD_JUR_CD;
+                  &oVendorWthdJur.DEFAULT_JUR_FLG = "Y";
+                  &oVendorWthdJur.DEFAULT_CLASS = &wthd_class;
+                  &oVendorWthdJur.WTHD_FLG = "Y";
+                  &oVendorWthdJur.VENDOR_CATEGORY = &INCR_VENDOR_CATEGORY;
+                  &oVendorWthdJur = &oVendorWthdJurCollection.insertitem(&oVendorWthdCollection.count);
+                  &oTuVndrIdCi.WTHD_SW_VEN = "Y";
+               End-If;
+            End-For;
+            &oVendorWthd.WTHD_ENTITY = &INCR_WTHD_ENTITY;
+            &oVendorWthd.ADDRESS_SEQ_NUM = 1;
+            &oVendorWthd.TIN_TYPE = "F";
+         End-If;
+         /* #9082, Madhu Boddupalli - Neustart/Sontiq project changes - Withholding assignment for INALL and LAALL (Costa Rica) - End */
+         
+         
+         /*Begin - #7387, GLINGA - Withholding values */
+         /* #8646, 6/17/2022, Madhu Boddupalli - Withholding logic change for Colombia - Start */
+         rem If ((Upper(&vendorWithHoldingSwitch) = "Y") And isLASetId(&sSetid)) Then;
+         /* #9672, Madhu Boddupalli - Colombia BAU change - Assign withholding remit-supplier info - Start */
+         rem If isLASetId(&sSetid) And Len(RTrim(&apacWitholding)) > 0 Then;
+         If isLASetId(&sSetid) And
+               Len(RTrim(&apacWitholding)) > 0 And
+               All(&OrganizationType) Then
+            /* #9672, Madhu Boddupalli - Colombia BAU change - Assign withholding remit-supplier info - End */
+            rem &oLog.Logit("Creating Witholding Line");
+            &oLog.Logit("Creating Witholding Line for LAALL (Colombia) - " | &arrWthClass.len);
+            /* #8646, 6/17/2022, Madhu Boddupalli - Withholding logic change for Colombia - End */
+            For &iVWJ = 1 To &arrWthClass.len
+               /* #8646, 6/17/2022, Madhu Boddupalli - Withholding logic change for Colombia - &class_tin field holds ID number type for Cololmbia. For US & India regions, this field holds 1099 value - Start */
+               rem &wthd_class = &arrWthClass [&iVWJ];
+               &COL_Witholding_RULE = &arrWthClass [&iVWJ];
+               rem If All(&wthd_class) And Upper(&wthd_class) <> Upper("Tax Exempt") Then;
+               /* #8646, 6/17/2022, Madhu Boddupalli - Withholding logic change for Colombia - End */
+               
+               &oVendorWthdJur.WTHD_ENTITY = getWitholdingCode(&sSetid); /*LA*/
+               /* #8646, 6/17/2022, Madhu Boddupalli - Withholding logic change for Colombia - Start */
+               rem SQLExec("SELECT  WTHD_TYPE, WTHD_JUR_CD FROM SYSADM.PS_WTHD_ENTITY_DTL WHERE WTHD_ENTITY = :1 AND WTHD_CLASS = :2", getWitholdingCode(&sSetid), &apacWitholding, &LA_WTHD_TYPE, &LA_WTHD_JUR_CD);
+               &oLog.Logit("Withholding Rule: " | &COL_Witholding_RULE);
+               SQLExec("SELECT WTHD_TYPE, WTHD_JUR_CD, WTHD_CLASS FROM PS_WTHD_CATEGORY WHERE WTHD_ENTITY = :1 AND WTHD_RULE = :2", getWitholdingCode(&sSetid), &COL_Witholding_RULE, &LA_WTHD_TYPE, &LA_WTHD_JUR_CD, &LA_WTHD_CLASS);
+               /* #8646, 6/17/2022, Madhu Boddupalli - Withholding logic change for Colombia - End */
+               &oVendorWthdJur.WTHD_TYPE = &LA_WTHD_TYPE;
+               &oVendorWthdJur.WTHD_JUR_CD = &LA_WTHD_JUR_CD;
+               &oVendorWthdJur.DEFAULT_JUR_FLG = "Y";
+               /* #8646, 6/17/2022, Madhu Boddupalli - Withholding logic change for Colombia - Start */
+               rem &oVendorWthdJur.DEFAULT_CLASS = &wthd_class;
+               &oVendorWthdJur.DEFAULT_CLASS = &LA_WTHD_CLASS;
+               &oVendorWthdJur.WTHD_IND = "S";
+               /* #8646, 6/17/2022, Madhu Boddupalli - Withholding logic change for Colombia - End */
+               &oVendorWthdJur.WTHD_FLG = "Y";
+               /* #8646, 6/17/2022, Madhu Boddupalli - Withholding logic change for Colombia - Start */
+               rem &oVendorWthdJur.VENDOR_CATEGORY = getVendorCategory(&sSetid);
+               SQLExec("SELECT VENDOR_CATEGORY FROM PS_WTHD_CATEGORY E WHERE WTHD_ENTITY = :1 AND WTHD_TYPE = :2 AND WTHD_JUR_CD = :3 AND WTHD_CLASS = :4 AND EFFDT = (SELECT MAX(I.EFFDT) FROM PS_WTHD_CATEGORY I WHERE I.WTHD_ENTITY = E.WTHD_ENTITY)", getWitholdingCode(&sSetid), &LA_WTHD_TYPE, &LA_WTHD_JUR_CD, &LA_WTHD_CLASS, &LA_VENDOR_CATEGORY);
+               &oLog.Logit("Withholding Entity, Type, Jurisdiction, Class and Category (Status): " | getWitholdingCode(&sSetid) | ", " | &LA_WTHD_TYPE | ", " | &LA_WTHD_JUR_CD | ", " | &LA_WTHD_CLASS | " and " | &LA_VENDOR_CATEGORY);
+               &oVendorWthdJur.VENDOR_CATEGORY = &LA_VENDOR_CATEGORY;
+               &oVendorWthdJur.WTHD_RULE = &COL_Witholding_RULE;
+               /* #8646, 6/17/2022, Madhu Boddupalli - Withholding logic change for Colombia - End */
+               
+               /* #9672, Madhu Boddupalli - Colombia BAU change - Assign withholding remit-supplier info - Start */
+               &LA_WTHD_SETID_TYPE = &sSetid | "_" | &LA_WTHD_TYPE;
+               &oVendorWthdJur.REMIT_WTHD_TO_FLG = "V";
+               SQLExec("SELECT SUBSTR(STRING_TEXT,1, INSTR(STRING_TEXT, '_')-1), SUBSTR(STRING_TEXT, INSTR(STRING_TEXT, '_')+1, LENGTH(STRING_TEXT)) FROM SYSADM.PS_STRINGS_TBL WHERE PROGRAM_ID = 'TU_P2P_1' AND STRING_ID = :1", &LA_WTHD_SETID_TYPE, &LA_REMIT_SUPP, &LA_REMIT_LOC);
+               &oVendorWthdJur.REMIT_VENDOR_0 = &LA_REMIT_SUPP;
+               &oVendorWthdJur.REMIT_LOC_0 = &LA_REMIT_LOC;
+               /* #10452, Madhu Boddupalli - Modified code to populate withholding address seq number based on the location code - Start */
+               rem &oVendorWthdJur.REMIT_ADDR_SEQ_NUM_0 = SupplierAddrSeq(&sSetid, &tVendorId);
+               &oVendorWthdJur.REMIT_ADDR_SEQ_NUM_0 = SupplierAddrSeq(&sSetid, &LA_REMIT_SUPP, &LA_REMIT_LOC);
+               &oLog.Logit("Withholding &sSetid, SETID_WTHDTYPE, REMIT SUPPLIER, LOCATION, ADDRESS SEQ: " | &sSetid | ";" | &LA_WTHD_SETID_TYPE | ";" | &LA_REMIT_SUPP | ";" | &LA_REMIT_LOC | ";" | &oVendorWthdJur.REMIT_ADDR_SEQ_NUM_0);
+               rem SupplierAddrSeq(&sSetid, &LA_REMIT_SUPP, &LA_REMIT_LOC));
+               /* #10452, Madhu Boddupalli - Modified code to populate withholding address seq number based on the location code - End */
+               /* #9672, Madhu Boddupalli - Colombia BAU change - Assign withholding remit-supplier info - End */
+               
+               &oVendorWthdJur = &oVendorWthdJurCollection.insertitem(&oVendorWthdCollection.count);
+               &oTuVndrIdCi.WTHD_SW_VEN = "Y";
+               /* #8646, 6/17/2022, Madhu Boddupalli - Withholding logic change for Colombia - Start */
+               rem End-If;
+               /* #8646, 6/17/2022, Madhu Boddupalli - Withholding logic change for Colombia - End */
+            End-For;
+            &oVendorWthd.WTHD_ENTITY = getWitholdingCode(&sSetid); /*asia*/
+            &oVendorWthd.ADDRESS_SEQ_NUM = 1;
+            &oVendorWthd.TIN_TYPE = "F";
+         Else
+            /* #9082, Madhu Boddupalli - Neustart/Sontiq project changes - Start */
+            rem If isLASetId(&sSetid) Then;
+            If isLASetId(&sSetid) And
+                  All(&OrganizationType) Then
+               rem &oLog.Logit("LAALL: No withholding details exits");
+               &oLog.Logit("LAALL: No withholding details exits for Colombia");
+               /* #9082, Madhu Boddupalli - Neustart/Sontiq project changes - End */
+            End-If;
+         End-If;
+         /*ENd - #7387, GLINGA - Withholding values */
+         
+         
+         &debugArray.Push("&fed_tin: " | &fed_tin);
+         &debugArray.Push("&int_tin: " | &int_tin);
+         rem TU 2354 Jalaj Asia Implementation 06/11/2021;
+         
+         /* #9082, Madhu Boddupalli - Fix for Production issue - Start */
+         <* Commented this code and added updated code below;
+	If isIndiaSetId(&setId) Then
+            &oVndrLocIdNbr.STD_ID_NUM_QUAL = "MSM";
+            &oVndrLocIdNbr.STD_ID_NUM = &msmeNumber;
+            
+            /*Begin - #7387, GLINGA - LA Imp International Tax ID*/
+         Else
+            If isLASetId(&sSetid) Then
+               
+               &oVndrLocIdNbr.STD_ID_NUM_QUAL = "FED";
+               If All(&int_tin) Then
+                  &oVndrLocIdNbr.STD_ID_NUM = &int_tin;
+               Else
+                  &oVndrLocIdNbr.STD_ID_NUM = &msmeNumber;
+               End-If;
+               /*End - #7387, GLINGA - LA Imp International Tax ID*/
+            Else
+               If All(&fed_tin) Then
+                  /* &oVndrLocIdNbr.STD_ID_NUM_QUAL = "FED"; */
+                  &oVndrLocIdNbr.STD_ID_NUM_QUAL = "TIN";
+                  &oVndrLocIdNbr.STD_ID_NUM = &fed_tin;
+               Else
+                  If All(&int_tin) Then
+                     /* &oVndrLocIdNbr.STD_ID_NUM_QUAL = "TIN"; */
+                     &oVndrLocIdNbr.STD_ID_NUM_QUAL = "FED";
+                     &oVndrLocIdNbr.STD_ID_NUM = &int_tin;
+                  End-If;
+               End-If;
+            End-If;
+         End-If;*>
+         
+         /* MSME is specific to India. Add Federal Tax ID, International Tax Number, DUNS if available */
+         /* #12169 Alice Mak, added logic to insert Vendor Location Id Number Collection for each Id Type >> &oVndrLocIdNbr = &oVndrLocIdNbrCollection.insertitem(&id) */
+         &id = 0;
+         &oLog.Logit("***MSM: " | &msmeNumber);
+         If isIndiaSetId(&sSetid) And
+               All(&msmeNumber) Then
+            &id = &id + 1;
+            &oVndrLocIdNbr = &oVndrLocIdNbrCollection.Item(&id);
+            &oVndrLocIdNbr.STD_ID_NUM_QUAL = "MSM";
+            &oVndrLocIdNbr.STD_ID_NUM = &msmeNumber;
+            &oLog.Logit("LOC ID NUM row: " | &id | " - " | &msmeNumber);
+            &oVndrLocIdNbr = &oVndrLocIdNbrCollection.insertitem(&id);
+         End-If;
+         
+         &oLog.Logit("***International Tax ID: " | &int_tin);
+         If All(&int_tin) Then
+            &id = &id + 1;
+            &oVndrLocIdNbr = &oVndrLocIdNbrCollection.Item(&id);
+            /* #8953, Madhu Boddupalli - Project Argus (Verisk) - ACN for Australia - Start */
+            &oLog.Logit("***Primary address country: " | &sqlparmvad_country);
+            If Upper(&sqlparmvad_country) = "AUSTRALIA" Then
+               &oLog.Logit("***STD_ID_NUM_QUAL is ACN");
+               &oVndrLocIdNbr.STD_ID_NUM_QUAL = "ACN";
+            Else
+               &oLog.Logit("***STD_ID_NUM_QUAL is FED");
+               /* #8953, Madhu Boddupalli - Project Argus (Verisk) - ACN for Australia - End */
+               &oVndrLocIdNbr.STD_ID_NUM_QUAL = "FED";
+            End-If; /* #8953, Madhu Boddupalli - Project Argus (Verisk) - ACN for Australia - Start/End */
+            &oVndrLocIdNbr.STD_ID_NUM = &int_tin;
+            &oLog.Logit("LOC ID NUM row: " | &id | " - " | &int_tin);
+            &oVndrLocIdNbr = &oVndrLocIdNbrCollection.insertitem(&id);
+         End-If;
+         
+         &oLog.Logit("***Federal ID: " | &fed_tin);
+         If All(&fed_tin) Then
+            &id = &id + 1;
+            &oVndrLocIdNbr = &oVndrLocIdNbrCollection.Item(&id);
+            &oVndrLocIdNbr.STD_ID_NUM_QUAL = "TIN";
+            &oVndrLocIdNbr.STD_ID_NUM = &fed_tin;
+            &oLog.Logit("LOC ID NUM row: " | &id | " - " | &fed_tin);
+            &oVndrLocIdNbr = &oVndrLocIdNbrCollection.insertitem(&id);
+         End-If;
+         
+         &oLog.Logit("***DUNS: " | &duns);
+         If All(&duns) Then
+            &id = &id + 1;
+            &oVndrLocIdNbr = &oVndrLocIdNbrCollection.Item(&id);
+            &oVndrLocIdNbr.STD_ID_NUM_QUAL = "DNS";
+            &oVndrLocIdNbr.STD_ID_NUM = &duns;
+            &oLog.Logit("LOC ID NUM row: " | &id | " - " | &duns);
+            &oVndrLocIdNbr = &oVndrLocIdNbrCollection.insertitem(&id);
+         End-If;
+         
+         /* #9082, Madhu Boddupalli - Fix for Production issue - End */
+         
+         /* AMAK 04/07/2021 SR# 4771 End:
+1 - Coupa Federal (US) Tax Id will use type TIN instead of FED in PeopleSoft.  FEB_TIN is validated for 9 characters in length, and it's notated in Coupa on FEB TAX ID field.
+2 - Coupa International Tax Id will use type FED instead of TIN in PeopleSoft.  INT_TIN can be any length, "FED" value is not delivered and therefore has no validation. 
+3 - If supplier is in a VAT country the International Tax Id will be populated on both the Location Id Numbers and the VAT Registration page. */
+         
+         rem End-If;
+         
+         /* #12082 Supplier Address SEQ and Location SEQ should be 1 to 1 >> MOVED to the End-If and before the End-For below. START */
+         /*        &new = &aAddressSeq.Find(&vaCoupaKey | "-" | &vaAddressSeq);
+         If (&new > 0) Then
+            &rTuCPSMVDMAP.setdefault();
+            &rTuCPSMVDMAP.setid.value = &sSetid;
+            If None(&tVendorId) Then
+               &rTuCPSMVDMAP.vendor_id.value = "NEXT";
+            Else
+               &rTuCPSMVDMAP.vendor_id.value = &tVendorId;
+            End-If;
+            &rTuCPSMVDMAP.TU_CP_CHAR1.value = &vaCoupaKey | "-" | &vaAddressSeq;
+            &rTuCPSMVDMAP.address_seq_num.value = &aAddressSeq [&new][2];
+            &rTuCPSMVDMAP.vndr_loc.value = &psVndrLoc;
+            If (&oVndrBankAcct <> Null) Then
+               &rTuCPSMVDMAP.bank_acct_seq_nbr.value = &oVndrBankAcct.bank_acct_seq_nbr;
+            Else
+            End-If;
+            &rTuCPSMVDMAP.last_update_dttm.value = %Datetime;
+            &debugArray.Push("Writing to the Record");
+            If Not (&rTuCPSMVDMAP.insert()) Then
+               &debugArray.Push("Insert Failed, Updating Data");
+               &rTuCPSMVDMAP.update();
+            End-If;
+         End-If;
+         printdebug(&debugArray);             */
+         /* #12082 Supplier Address SEQ and Location SEQ should be 1 to 1 >> MOVED to the End-If and before the End-For below. END */
+         
+         /* #6183, 1/27/2022, Madhu Boddupalli - Start */
+      Else
+         /* #12082
+         &rta_active_loc_num = &rta_active_loc_num - 1;
+         &oLog.Logit("***Location Line: " | &rta_active_loc_num);
+ #12082 */
+         If Upper(&vaAddressActive) = "FALSE" Then
+            &oLog.Logit("***Location Line: RTA line status is " | &vaAddressActive | " for the address seq number " | &vaAddressSeq);
+            
+            /* #12082 Supplier Address SEQ and Location SEQ should be 1 to 1 - START. */
+            /* &oLog.Logit("*** &LOCATION_LINE & &loc_seq: " | &LOCATION_LINE | " & " | &loc_seq); */
+            SQLExec("SELECT SETID, VENDOR_ID, ADDRESS_SEQ_NUM, VNDR_LOC FROM PS_TU_CP_SM_VD_MAP WHERE TU_CP_CHAR1 = :1 ", &vaCoupaKey | "-" | &vaAddressSeq, &psSetID, &psVndrID, &psAddressSeq, &psVndrLoc);
+            /* &oLog.Logit("MAPPING: " | &vaCoupaKey | "-" | &vaAddressSeq | " ; " | &psSetID | " ; " | &psVndrID | " ; " | &psAddressSeq | " ; " | &psVndrLoc); */
+            
+            If &oVndrLocScrolCollection.ItemByKeys(&psVndrLoc) <> Null Then /* VNDR LOC existed in PS */
+               SQLExec("select L.EFF_STATUS from PS_VENDOR_LOC L where L.SETID = :1 and L.VENDOR_ID = :2 and L.VNDR_LOC = :3 and L.EFFDT = (select max(LOC.EFFDT) from PS_VENDOR_LOC LOC where L.SETID = LOC.SETID and L.VENDOR_ID = LOC.VENDOR_ID and L.VNDR_LOC = LOC.VNDR_LOC and LOC.EFFDT <= :4)", &psSetID, &psVndrID, &psVndrLoc, %Date, &psLocEffStatus);
+               /*&oLog.Logit(" location seq " | &psVndrLoc | " from mapping existed on VENDOR_LOC.EFF_STATUS max(EFFDT): " | &psLocEffStatus);*/
+               &oLog.Logit("*** no update on FALSE RTA address seq number " | &vaAddressSeq | "; PS loc " | &psVndrLoc);
+            Else
+               /* No existing &oVndrLocScrolCollection.ItemByKeys(&psVndrLoc) in PS */
+               &oLog.Logit("*** no action on FALSE RTA address seq number " | &vaAddressSeq);
+            End-If;
+            /* #12082 Supplier Address SEQ and Location SEQ should be 1 to 1 - END. */
+            
+         End-If;
+      End-If;
+      /* #6183, 1/27/2022, Madhu Boddupalli - End */
+      
+      /* #12082 Supplier Address SEQ and Location SEQ should be 1 to 1 >> MOVED from the above If Upper(&vaAddressActive) = "TRUE" section. START */
+      &new = &aAddressSeq.Find(&vaCoupaKey | "-" | &vaAddressSeq);
+      If (&new > 0) Then
+         &rTuCPSMVDMAP.setdefault();
+         &rTuCPSMVDMAP.setid.value = &sSetid;
+         If None(&tVendorId) Then
+            &rTuCPSMVDMAP.vendor_id.value = "NEXT";
+         Else
+            &rTuCPSMVDMAP.vendor_id.value = &tVendorId;
+         End-If;
+         &rTuCPSMVDMAP.TU_CP_CHAR1.value = &vaCoupaKey | "-" | &vaAddressSeq;
+         &rTuCPSMVDMAP.address_seq_num.value = &aAddressSeq [&new][2];
+         &rTuCPSMVDMAP.vndr_loc.value = &psVndrLoc;
+         If (&oVndrBankAcct <> Null) Then
+            &rTuCPSMVDMAP.bank_acct_seq_nbr.value = &oVndrBankAcct.bank_acct_seq_nbr;
+         Else
+         End-If;
+         &rTuCPSMVDMAP.last_update_dttm.value = %Datetime;
+         &debugArray.Push("Writing to the Record");
+         If Not (&rTuCPSMVDMAP.insert()) Then
+            &debugArray.Push("Insert Failed, Updating Data");
+            &rTuCPSMVDMAP.update();
+         End-If;
+      End-If;
+      printdebug(&debugArray);
+      /* #12082 Supplier Address SEQ and Location SEQ should be 1 to 1 >> MOVED from the above If Upper(&vaAddressActive) = "TRUE" section. END */
+      
+   End-For;
+   &rTuCPSMVDMAP.save();
+   &oVndrCntctScrCollection = &oTuVndrIdCi.VNDR_CNTCT_SCR;
+   For &CONTACT_LINE = 1 To &rs_tu_cp_dt_explContact.ActiveRowCount
+      &vcContactSeq = &rs_tu_cp_dt_explContact(&CONTACT_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierContact" | "CNTCT_SEQ_NUM"))][2])).Value;
+      rem if there is no contact sequence number then break;
+      If None(&vcContactSeq) Then
+         &oLog.Logit("***No Contact Line ");
+         Break;
+      End-If;
+      &oLog.Logit("***Contact Line: " | &CONTACT_LINE);
+      &oVndrCntctScr = &oVndrCntctScrCollection.Item(1);
+      /*If Not (&existing) Then
+         If &CONTACT_LINE = 1 Then
+            &oVndrCntctScr = &oVndrCntctScrCollection.Item(1);
+         Else
+            &oVndrCntctScr = &oVndrCntctScrCollection.insertItem(&oVndrCntctScrCollection.Count);
+         End-If;
+      Else
+         If &oVndrCntctScrCollection.ItemByKeys(&vcContactSeq) <> Null Then
+            &oVndrCntctScr = &oVndrCntctScrCollection.ItemByKeys(&vcContactSeq);
+         Else
+            &oVndrCntctScr = &oVndrCntctScrCollection.insertitem(&oVndrCntctScrCollection.Count);
+            
+         End-If;
+         
+      End-If;*/
+      &oVendorCntctCollection = &oVndrCntctScr.VENDOR_CNTCT;
+      
+      &oVendorCntct = &oVendorCntctCollection.Item(1);
+      If &oVendorCntct.EFFDT_7 = %Date Then
+         &oVendorCntct = &oVendorCntctCollection.Item(1);
+      Else
+         &oVendorCntct = &oVendorCntctCollection.InsertItem(&oVendorCntctCollection.Count);
+      End-If;
+      &oVendorCntct.EFFDT_7 = %Date;
+      
+      &oVendorCntct.EFF_STATUS_1 = "A";
+      
+      &contact_name_p1 = &rs_tu_cp_dt_explContact(&CONTACT_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierContact" | "CONTACT_NAME1"))][2])).Value;
+      &contact_name_p2 = &rs_tu_cp_dt_explContact(&CONTACT_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierContact" | "CONTACT_NAME2"))][2])).Value;
+      &full_name = &rs_tu_cp_dt_explContact(&CONTACT_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierContact" | "FULL_NAME"))][2])).Value;
+      If All(&full_name) Then
+         &oVendorCntct.CONTACT_NAME = &full_name;
+      Else
+         &oVendorCntct.CONTACT_NAME = &contact_name_p1 | " " | &contact_name_p2;
+      End-If;
+      &contactType = &rs_tu_cp_dt_explContact(&CONTACT_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierContact" | "CONTACT_TYPE"))][2])).Value;
+      &oVndrCntctScr.DESCR_0 = &contactType;
+      &oVendorCntct.ADDRESS_SEQ_NUM = 1;
+      Evaluate &contactType
+      When "Primary"
+         &oVendorCntct.EMAILID_1 = &rs_tu_cp_dt_explContact(&CONTACT_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierContact" | "EMAILID"))][2])).Value;;
+         &oVendorCntct.CONTACT_TYPE = 1;
+         Break;
+      When "Sales"
+         &oVendorCntct.EMAILID_1 = &rs_tu_cp_dt_explContact(&CONTACT_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierContact" | "EMAILID"))][2])).Value;;
+         &oVendorCntct.CONTACT_TYPE = 2;
+         Break;
+      When "Account Receivable"
+         &oVendorCntct.CONTACT_TYPE = 4;
+         &oVendorCntct.EMAILID_1 = &rs_tu_cp_dt_explContact(&CONTACT_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierContact" | "EMAILID"))][2])).Value;;
+         Break;
+      When "PO Delivery"
+         &oVendorCntct.CONTACT_TYPE = 3;
+         &oVendorCntct.EMAILID_1 = &contactType_Email;
+         Break;
+      When-Other
+         &oVendorCntct.EMAILID_1 = &rs_tu_cp_dt_explContact(&CONTACT_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierContact" | "EMAILID"))][2])).Value;;
+         &oVendorCntct.CONTACT_TYPE = 1;
+      End-Evaluate;
+      
+      
+      REM &oVendorCntct.CONTACT_TITLE = &cntctrec.CONTACT_TITLE.Value;
+      rem &oVendorCntct.URL = &cntctrec.URL.Value;
+      
+      &oVndrCntctPhnCollection = &oVendorCntct.VNDR_CNTCT_PHN;
+      For &i_oVndrCntctPhnCollection = &oVndrCntctPhnCollection.count To 1 Step - 1
+         &oVndrCntctPhnCollection.Deleteitem(&i_oVndrCntctPhnCollection);
+      End-For;
+      rem &oVndrCntctPhn = &oVndrCntctPhnCollection.insertItem(&oVndrCntctPhnCollection.Count);
+      &oVndrCntctPhn = &oVndrCntctPhnCollection.Item(1);
+      &oVndrCntctPhn = &oVndrCntctPhnCollection.insertItem(&oVndrCntctPhnCollection.Count);
+      &oVndrCntctPhn.PHONE_TYPE = "BUSN";
+      &oVndrCntctPhn.PHONE = &rs_tu_cp_dt_explContact(&CONTACT_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierContact" | "PHONE-BUSN"))][2])).Value;
+      &oVndrCntctPhn = &oVndrCntctPhnCollection.insertItem(&oVndrCntctPhnCollection.Count);
+      &oVndrCntctPhn.PHONE_TYPE = "CELL";
+      &oVndrCntctPhn.PHONE = &rs_tu_cp_dt_explContact(&CONTACT_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierContact" | "PHONE-WORK"))][2])).Value;;
+      
+      &oVndrCntctPhn = &oVndrCntctPhnCollection.insertItem(&oVndrCntctPhnCollection.Count);
+      &oVndrCntctPhn.PHONE_TYPE = "FAX";
+      
+      &oVndrCntctPhn.PHONE = &rs_tu_cp_dt_explContact(&CONTACT_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierContact" | "PHONE-FAX"))][2])).Value;
+      
+   End-For;
+   
+   If &oTuVndrIdCi.Save() Then
+      
+      CommitWork();
+      &oLog.LogitDebug("&sSetid,&vaCoupaKey,&panNumber, &oTuVndrIdCi.vendor_id:" | &sSetid | "," | &vaCoupaKey | "," | &panNumber | "," | &oTuVndrIdCi.vendor_id);
+      SQLExec(SQL.TU_CP_SIM_VNDR_EXS_SQL, &sSetid, &vaCoupaKey, Substring(LTrim(&int_tin), 1, 15));
+      SQLExec(SQL.TU_CP_SIM_IND_PAN_SQL, &sSetid, &vaCoupaKey, &panNumber);
+      CommitWork();
+      
+   Else
+      GetRecord().AE_APPSTATUS.Value = 1;
+   End-If;
+   errorHandler(&rs_tu_cp_dt_explHdr(&HDR_LINE).GetRecord(1), &oSession);
+   /*~Transunion 09162020 Jalaj Mehta - Fix for no Address Line Emails*/
+   &contactType_Email = &rs_tu_cp_dt_explHdr(&HDR_LINE).GetRecord(1).GetField(@("Field." | &o2pArray2d [&o2pArray2d.Find(Upper("SupplierHeader" | "CONTACT_TYPE+EMAILID"))][2])).Value;
+   If All(&contactType_Email) And
+         (&existing) And
+         None(&vaAddressSeq) Then
+      &oLog.Logit("***No Address Line***Updating the Email");
+      &oLog.LogitDebug("***EmailId:" | &contactType_Email);
+      SQLExec(SQL.TU_CP_VNDR_EML_UPD_SQL, &contactType_Email, &tVendorId, &sSetid);
+   End-If;
+   /*~Transunion 09162020 Jalaj Mehta - Fix for no Address Line Emails*/
+   printdebug(&debugArray);
+   
+End-For;
+
+&rTuCPSMVDMAP.save();
+CommitWork();
